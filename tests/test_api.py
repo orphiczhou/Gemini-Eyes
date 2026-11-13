@@ -1,0 +1,138 @@
+"""Synthetic tests for the REST facade and per-request model overrides.
+
+All offline: pure payload helpers, the error translation table and the
+per-request fallback-chain rebuild. No network, no real client session.
+"""
+
+from gemini_mcp.api import (
+    _ERROR_MAP,
+    _gemini_error_response,
+    _messages_to_prompt,
+    _resolve_thinking,
+)
+from gemini_mcp.gemini_client import GeminiWebClient, GeminiWebError
+
+
+# ---------------------------------------------------------------------------
+# _messages_to_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_messages_single_turn():
+    prompt = _messages_to_prompt([{"role": "user", "content": "hi"}], False)
+    assert prompt == "hi"
+
+
+def test_messages_system_prefix():
+    msgs = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    prompt = _messages_to_prompt(msgs, False)
+    assert prompt.startswith("<system instructions>be brief</system instructions>")
+    assert prompt.endswith("hi")
+
+
+def test_messages_multiturn_transcript():
+    msgs = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]
+    prompt = _messages_to_prompt(msgs, False)
+    assert "[user]\na" in prompt
+    assert "[assistant]\nb" in prompt
+    assert prompt.endswith("[assistant]")
+
+
+def test_messages_continue_sends_last_user_only():
+    msgs = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]
+    assert _messages_to_prompt(msgs, True) == "c"
+
+
+def test_messages_parts_array_content():
+    msgs = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "part1"}, {"type": "text", "text": "part2"}],
+        }
+    ]
+    assert _messages_to_prompt(msgs, False) == "part1\npart2"
+
+
+# ---------------------------------------------------------------------------
+# thinking resolution
+# ---------------------------------------------------------------------------
+
+
+def test_thinking_explicit_wins_over_effort():
+    assert _resolve_thinking({"gemini_thinking": 3, "reasoning_effort": "low"}) == 3
+    assert _resolve_thinking({"gemini_thinking": "deep"}) == "deep"
+
+
+def test_thinking_effort_mapping():
+    assert _resolve_thinking({"reasoning_effort": "minimal"}) == 1
+    assert _resolve_thinking({"reasoning_effort": "low"}) == 1
+    assert _resolve_thinking({"reasoning_effort": "medium"}) == 2
+    assert _resolve_thinking({"reasoning_effort": "high"}) == 2
+    assert _resolve_thinking({}) is None
+
+
+# ---------------------------------------------------------------------------
+# error translation (no upstream text ever echoed)
+# ---------------------------------------------------------------------------
+
+
+def test_error_response_maps_all_codes():
+    for code, (status, _name, _msg) in _ERROR_MAP.items():
+        resp = _gemini_error_response(GeminiWebError("should not leak", code=code))
+        assert resp.status_code == status
+
+
+def test_error_response_transport_and_generic():
+    assert _gemini_error_response(GeminiWebError("x", transport=True)).status_code == 502
+    assert _gemini_error_response(GeminiWebError("x")).status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# per-request model chain rebuild
+# ---------------------------------------------------------------------------
+
+
+def _client(model=None, thinking=None) -> GeminiWebClient:
+    return GeminiWebClient({"__Secure-1PSID": "x"}, model=model, thinking=thinking)
+
+
+def test_chain_override_model_and_thinking():
+    client = _client("argon", 2)
+    chain = client._build_model_chain("flash", 1)
+    assert chain[0].label == "flash"
+    assert chain[0].thinking == 1
+    # the instance default chain is untouched
+    assert client.model_chain[0].label == "argon"
+    assert client.model_chain[0].thinking == 2
+
+
+def test_chain_override_thinking_only_keeps_model():
+    client = _client("pro", 2)
+    chain = client._build_model_chain(None, 1)
+    assert chain[0].label == "pro"
+    assert chain[0].thinking == 1
+
+
+def test_chain_noop_returns_default():
+    client = _client()
+    assert client._build_model_chain(None, None) is client.model_chain
+
+
+def test_chain_legacy_request():
+    client = _client("argon", 2)
+    assert client._build_model_chain("legacy", None) == [None]
+
+
+def test_chain_always_ends_with_legacy_fallback():
+    client = _client()
+    chain = client._build_model_chain("flash-lite", None)
+    assert chain[-1] is None
+    assert all(setting is None or hasattr(setting, "label") for setting in chain)

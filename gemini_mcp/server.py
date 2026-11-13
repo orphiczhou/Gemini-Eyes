@@ -13,11 +13,18 @@ Run over HTTP (SSE/streamable)::
 
 Tools exposed:
 
-* gemini_send_message        — send a prompt (or continue a conversation)
+* gemini_send_message        — send a prompt (or continue a conversation),
+                               with per-call ``model`` / ``thinking`` overrides
+* gemini_models              — selectable model tiers + thinking levels
+* gemini_usage               — local usage counters + fallback events
 * gemini_list_conversations  — recent conversations from the account
 * gemini_read_conversation   — full history of one conversation
 * gemini_delete_conversation — delete a conversation
 * gemini_status              — cookie/token diagnostics
+
+``--transport http`` additionally serves an OpenAI-compatible REST facade on
+the same port (see api.py): POST /v1/chat/completions, GET /v1/models,
+/v1/status, /v1/usage, plus an unauthenticated GET /healthz probe.
 """
 
 from __future__ import annotations
@@ -28,14 +35,26 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from mcp.server import MCPServer
 
 from .cookie_extractor import cookies_for_gemini
-from .gemini_client import DEFAULT_METADATA, MediaRef, GeminiWebClient, GeminiWebError
+from .gemini_client import (
+    DEFAULT_METADATA,
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_FALLBACK_CHAIN,
+    DEFAULT_THINKING,
+    MediaRef,
+    MODEL_ALIASES,
+    MODEL_CATALOG,
+    GeminiWebClient,
+    GeminiWebError,
+    THINKING_LEVELS,
+)
 
 log = logging.getLogger("gemini_mcp")
 
@@ -52,6 +71,12 @@ _metadata_cache: dict[str, list[Any]] = {}  # conversation_id -> metadata
 
 # How often to rotate __Secure-1PSIDTS in the background (seconds).
 _ROTATE_INTERVAL = 25 * 60
+
+# Single-cookie single-writer: the web session must not be driven
+# concurrently (review-20261102 P1-1). stdio was naturally serial; both the
+# HTTP MCP tools and the REST layer now share this process-wide lock around
+# generate() calls.
+_GENERATE_LOCK = threading.Lock()
 
 
 class _TokenAuthMiddleware:
@@ -94,12 +119,45 @@ class _TokenAuthMiddleware:
 
 
 async def _run_http_async(host: str, port: int, token: Optional[str]) -> None:
-    """Run the streamable-http transport behind the bearer-token middleware."""
+    """Run the streamable-http transport plus the REST facade on one port.
+
+    A thin ASGI dispatcher splits by path: ``/mcp*`` keeps serving the MCP
+    streamable app behind the bearer middleware (lifespan included, so the
+    MCP session manager still starts); everything else goes to the
+    OpenAI-compatible REST layer in :mod:`gemini_mcp.api`, which enforces the
+    same token itself and exempts ``/healthz`` for control-plane probes.
+    """
     import uvicorn
 
-    app = _TokenAuthMiddleware(mcp.streamable_http_app(host=host), token)
+    from .api import build_api_app
+
+    mcp_asgi = _TokenAuthMiddleware(mcp.streamable_http_app(host=host), token)
+    app = _DispatchApp(mcp_asgi, build_api_app(token))
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     await uvicorn.Server(config).serve()
+
+
+class _DispatchApp:
+    """Route ASGI http scopes by path; hand every other scope to the MCP app.
+
+    The lifespan scope (uvicorn startup/shutdown) must reach the MCP
+    streamable app — its session manager starts there — while the REST app
+    has no lifespan requirements and tolerates never seeing one.
+    """
+
+    def __init__(self, mcp_asgi: Any, api_asgi: Any) -> None:
+        self._mcp = mcp_asgi
+        self._api = api_asgi
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self._mcp(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path == "/mcp" or path.startswith("/mcp/"):
+            await self._mcp(scope, receive, send)
+        else:
+            await self._api(scope, receive, send)
 
 
 # Well-known fallback cookie location: marketplace users just drop their
@@ -252,13 +310,11 @@ REQUIRED_COOKIES = [
 ]
 
 
-@mcp.tool()
-def gemini_status() -> dict[str, Any]:
-    """Diagnose the connection to gemini.google.com: cookie availability, token freshness and reachability."""
+def _status_payload() -> dict[str, Any]:
+    """Connection diagnostics shared by the gemini_status tool and GET /v1/status."""
     import platform
 
     cookies, errors = _load_cookies()
-    names = sorted(cookies)
     key_names = [n for n in REQUIRED_COOKIES if n in cookies]
     missing = [n for n in REQUIRED_COOKIES if n not in cookies]
     status: dict[str, Any] = {
@@ -303,12 +359,111 @@ def gemini_status() -> dict[str, Any]:
 
 
 @mcp.tool()
+def gemini_status() -> dict[str, Any]:
+    """Diagnose the connection to gemini.google.com: cookie availability, token freshness and reachability."""
+    return _status_payload()
+
+
+@mcp.tool()
+def gemini_models() -> dict[str, Any]:
+    """List selectable model tiers and thinking levels.
+
+    Use the returned names with the ``model`` / ``thinking`` arguments of
+    ``gemini_send_message`` (and the ``model`` field / ``gemini_thinking``
+    body field of the OpenAI-compatible ``/v1/chat/completions`` endpoint).
+    """
+    tiers = []
+    for name, (model_id, capacity, number) in MODEL_CATALOG.items():
+        tiers.append(
+            {
+                "name": name,
+                "openai_id": f"gemini-{name}",
+                "capacity": capacity,
+                "mode_number": number,
+            }
+        )
+    return {
+        "default_model": DEFAULT_MODEL,
+        "default_thinking": DEFAULT_THINKING,
+        "fallback_chain": list(DEFAULT_MODEL_FALLBACK_CHAIN),
+        "tiers": tiers,
+        "model_aliases": MODEL_ALIASES,
+        "thinking_levels": THINKING_LEVELS,
+        "thinking_notes": (
+            "1=standard, 2=extended (default), 3=Deep Think "
+            "(asynchronous: first reply is only a processing placeholder)"
+        ),
+    }
+
+
+def _usage_payload() -> dict[str, Any]:
+    """Local usage counters + session health, shared by tool and REST surface.
+
+    The web backend has no per-account usage API, so this is process-local
+    accounting; fallback events (Argon -> Pro -> Flash on 1037/1052/1050) are
+    the practical "plan headroom is shrinking" signal.
+    """
+    from .usage import snapshot
+
+    data: dict[str, Any] = snapshot()
+    try:
+        client = _get_client()
+        data["model"] = client.model_description
+        data["fallback_events"] = list(client.fallback_events)[-20:]
+        data["cookie_rotation"] = {
+            "last_rotate_seconds_ago": (
+                round(time.time() - client._last_rotate_at)
+                if client._last_rotate_at else None
+            ),
+            "interval_seconds": _ROTATE_INTERVAL,
+            "persist_to": _cookie_file_path() if _cookies_from_file else None,
+        }
+    except Exception as e:  # noqa: BLE001 - diagnostics tool must not crash
+        data["errors"] = [str(e)]
+    return data
+
+
+@mcp.tool()
+def gemini_usage() -> dict[str, Any]:
+    """Local usage counters (requests, size estimates, model fallback events) + session health.
+
+    Google's web backend exposes no per-account quota API for the Gemini web
+    plan; this reports what this process has driven, plus degradation events
+    that indicate plan limits being hit upstream.
+    """
+    return _usage_payload()
+
+
+def _generate_serialized(
+    prompt: str,
+    metadata: Optional[list[Any]] = None,
+    files: Optional[list[str]] = None,
+    model: Optional[str] = None,
+    thinking: Optional[Union[int, str]] = None,
+):
+    """Run one generate call under the process-wide lock and remember the turn.
+
+    Usage accounting is left to the callers (the MCP tool and the REST layer
+    each count their own traffic exactly once).
+    """
+    client = _get_client()
+    with _GENERATE_LOCK:
+        result = client.generate(
+            prompt, metadata=metadata, files=files, model=model, thinking=thinking
+        )
+    _remember(result)
+    return result
+
+
+@mcp.tool()
 def gemini_send_message(
     message: str,
     conversation_id: Optional[str] = None,
     response_id: Optional[str] = None,
     language: Optional[str] = None,
     file_paths: Optional[list[str]] = None,
+    model: Optional[str] = None,
+    thinking: Optional[Union[int, str]] = None,
 ) -> dict[str, Any]:
     """Send a message to Gemini (web interface), optionally attaching files.
 
@@ -323,6 +478,12 @@ def gemini_send_message(
         language: UI/reply language hint, e.g. "zh-CN" (default), "en".
         file_paths: Local paths of images/videos to attach (uploaded to
             Gemini and analyzed together with the message).
+        model: Per-call model tier override (e.g. "argon", "pro", "flash",
+            "flash-lite", "legacy"). See gemini_models for the full list.
+            Unset keeps the process default (GEMINI_MODEL, default argon).
+        thinking: Per-call thinking depth override (1=standard, 2=extended,
+            3=Deep Think async, or aliases like "standard"/"deep"). Unset
+            keeps the process default (GEMINI_THINKING, default 2).
 
     Returns:
         The model's answer plus conversation_id/response_id/candidate_id to
@@ -344,8 +505,16 @@ def gemini_send_message(
     if language and language != client.language:
         client.language = language
     meta = _metadata_for(conversation_id, response_id)
-    result = client.generate(message.strip(), metadata=meta, files=file_paths)
-    _remember(result)
+    try:
+        result = _generate_serialized(
+            message.strip(), metadata=meta, files=file_paths,
+            model=model, thinking=thinking,
+        )
+    except Exception:  # noqa: BLE001 - count failed turns for the usage surface
+        from . import usage
+
+        usage.record_error()
+        raise
     return result.to_dict()
 
 

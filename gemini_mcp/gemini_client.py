@@ -506,6 +506,10 @@ class GeminiWebClient:
             # Last resort: the legacy payload (web default) still answers.
             chain.append(None)
             self.model_chain = chain
+        self.model_fallback_names = list(fallback_names)
+        # Telemetry for the usage surface (gemini_usage / GET /v1/usage):
+        # model-chain degradations are the practical "plan headroom" signal.
+        self.fallback_events: list[dict[str, Any]] = []
 
         self.session = requests.Session()
         for name, value in cookies.items():
@@ -716,20 +720,71 @@ class GeminiWebClient:
     # Generate content (StreamGenerate)
     # ------------------------------------------------------------------
 
+    def _build_model_chain(
+        self,
+        model: Optional[str] = None,
+        thinking: Optional[Union[int, str]] = None,
+    ) -> list[Optional[ModelSetting]]:
+        """Fallback chain for one call: per-request override or the default.
+
+        ``model``/``thinking`` set via :meth:`generate` win over the instance
+        settings; an unset field keeps the instance's choice (model name or
+        capacity) so callers can tune a single dimension per request.
+        """
+        if model is None and thinking is None:
+            return self.model_chain
+        base = self.model_setting
+        eff_model = model if model is not None else (base.label if base is not None else None)
+        eff_capacity = base.capacity if base is not None else None
+        setting = resolve_model_setting(eff_model, thinking, eff_capacity)
+        if setting is None:
+            # Explicit legacy request: one model-less payload, no fallbacks.
+            return [None]
+        chain: list[Optional[ModelSetting]] = [setting]
+        for name in self.model_fallback_names:
+            fallback = resolve_model_setting(name, setting.thinking, eff_capacity)
+            if fallback is not None and fallback not in chain:
+                chain.append(fallback)
+        # Last resort: the legacy payload (web default) still answers.
+        chain.append(None)
+        return chain
+
+    def _record_fallback(
+        self,
+        from_plan: Optional[ModelSetting],
+        to_plan: Optional[ModelSetting],
+        code: Optional[int],
+    ) -> None:
+        """Note one model-chain degradation for the usage/telemetry surface."""
+        self.fallback_events.append(
+            {
+                "ts": round(time.time(), 3),
+                "code": code,
+                "from": from_plan.label if from_plan is not None else "legacy",
+                "to": to_plan.label if to_plan is not None else "legacy",
+            }
+        )
+        del self.fallback_events[:-50]  # keep the tail, cap memory
+
     def generate(
         self,
         prompt: str,
         metadata: Optional[list[Any]] = None,
         files: Optional[list[str]] = None,
         on_frame: Optional[Callable[[Any], None]] = None,
+        model: Optional[str] = None,
+        thinking: Optional[Union[int, str]] = None,
     ) -> GenerationResult:
         """Send one prompt (optionally with attached files) and collect the streamed answer.
 
         Model and thinking depth come from ``self.model_chain`` (configured via
         the constructor arguments or ``GEMINI_MODEL`` / ``GEMINI_THINKING``).
+        ``model`` / ``thinking`` arguments override them for this call only
+        (see :meth:`_build_model_chain`).
         When the server rejects a candidate (usage limit, model unavailable) the
         next one is tried — fallback model, then the legacy model-less request —
         so an over-ambitious default degrades instead of breaking the tool.
+        Each degradation is recorded in ``self.fallback_events``.
         """
         self.ensure_fresh()
         self.init()
@@ -739,7 +794,7 @@ class GeminiWebClient:
         if files:
             file_data = [self.upload_file(path) for path in files]
 
-        plans = self.model_chain
+        plans = self._build_model_chain(model, thinking)
         index = 0
         last_error: Optional[GeminiWebError] = None
         while index < len(plans):
@@ -756,8 +811,10 @@ class GeminiWebClient:
                         index += 1
                     if index >= len(plans):
                         raise
+                    self._record_fallback(plan, plans[index], exc.code)
                     continue
                 if exc.code in MODEL_RETRY_CODES and index < len(plans):
+                    self._record_fallback(plan, plans[index], exc.code)
                     continue
                 raise
             result.elapsed = time.time() - start
