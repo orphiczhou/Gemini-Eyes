@@ -334,17 +334,29 @@ def _advance_cookie_baseline() -> None:
 
 
 def _get_client() -> GeminiWebClient:
+    """Process-level client singleton (double-checked locking).
+
+    Lock-free fast path once built. On a None singleton (cold start, or the
+    instant _maybe_reload_client clears it for a rebuild) the build happens
+    INSIDE _GENERATE_LOCK after a second check — without it, two lock-free
+    callers could both see None and each construct a client, breaking the
+    singleton (two live sessions driving one account). _maybe_reload_client
+    takes the same single lock (re-entrant), so no lock-order deadlock face.
+    """
     global _client
     if _client is not None:
         return _client
-    cookies, errors = _load_cookies()
-    if not cookies:
-        raise GeminiWebError(
-            "No Google cookies found. " + ("; ".join(errors) if errors else "")
-        )
-    _client = GeminiWebClient(cookies, language=_language)
-    _advance_cookie_baseline()
-    return _client
+    with _GENERATE_LOCK:
+        if _client is not None:  # double-check: a concurrent builder won
+            return _client
+        cookies, errors = _load_cookies()
+        if not cookies:
+            raise GeminiWebError(
+                "No Google cookies found. " + ("; ".join(errors) if errors else "")
+            )
+        _client = GeminiWebClient(cookies, language=_language)
+        _advance_cookie_baseline()
+        return _client
 
 
 def _maybe_reload_client() -> bool:
@@ -473,10 +485,16 @@ def _rotate_once() -> None:
     WARNING (the package logger feeds the sanitized event log) and bump
     auth_failures; a success clears the counter. The counters surface on
     /v1/status (cookie_rotation.last_result) and /healthz (auth_failures).
+
+    The singleton reference is taken INSIDE the lock: grabbing it earlier and
+    then waiting on the lock means a hot-reload that rebuilds the singleton
+    while we wait would leave us rotating — and persisting! — the STALE jar,
+    overwriting an externally dumped cookie file with old cookies (a false
+    success).
     """
     try:
-        client = _get_client()
         with _GENERATE_LOCK:
+            client = _get_client()  # latest singleton, under the lock
             rotated = client.rotate_cookies(
                 force=True, skip_if_fresh=True, cookie_file=_cookie_file_path()
             )

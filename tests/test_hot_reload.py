@@ -3,6 +3,10 @@
 All offline: the client singleton is rebuilt from a tmp cookie file, the
 generate/rotate paths are replaced by stubs, and the observability counters
 are reset between tests. No network, no daemon, no real Google session.
+
+The concurrency tests at the bottom (audit P2-A1/A2) align threads with a
+barrier/event but assert only INVARIANTS (exactly one construction; rotate
+sees the in-lock latest singleton) — never scheduling-dependent timing.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from types import SimpleNamespace
 
@@ -270,3 +275,107 @@ def test_healthz_auth_failures_present_when_not_ready(monkeypatch):
     assert payload["ok"] is False
     assert payload["ready"] is False
     assert payload["auth_failures"] == 0  # field exists even before any rotation
+
+
+# ---------------------------------------------------------------------------
+# Singleton locking (audit P2-A1 / P2-A2)
+# ---------------------------------------------------------------------------
+
+
+def test_get_client_builds_exactly_once_under_threads(monkeypatch, tmp_path):
+    """P2-A1: cold-start races on _get_client must not construct twice.
+
+    The hot-reload path briefly clears the singleton; without double-checked
+    locking, every lock-free caller seeing None builds its own client and the
+    singleton (single live web session) is broken. A barrier aligns the
+    racers and the stub constructor widens the window; the assertion is the
+    invariant itself: exactly one construction, one shared object.
+    """
+    cookie_file = tmp_path / "cookies.json"
+    _write_cookies(cookie_file, "v1")
+    monkeypatch.setattr(server, "_cookie_file", str(cookie_file))
+
+    built: list = []
+
+    def slow_factory(cookies, language=None):
+        built.append(SimpleNamespace(cookies=cookies, language=language))
+        time.sleep(0.02)  # constructor still running while racers arrive
+        return built[-1]
+
+    monkeypatch.setattr(server, "GeminiWebClient", slow_factory)
+
+    n = 8
+    barrier = threading.Barrier(n)
+    errors: list[str] = []
+
+    def worker() -> None:
+        try:
+            barrier.wait()
+            client = server._get_client()
+            if client not in built:
+                errors.append("client did not come from the factory")
+        except Exception as exc:  # noqa: BLE001 - record and fail
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert len(built) == 1  # exactly one construction — the singleton held
+    assert server._get_client() is built[0]
+
+
+def test_rotate_uses_latest_singleton_despite_hot_reload(monkeypatch, tmp_path):
+    """P2-A2: rotation must operate on the in-lock latest singleton.
+
+    Sequence: the rotate thread parks at the generate-lock door; while it
+    waits, a hot-reload (here driven re-entrantly under the same RLock)
+    rebuilds the singleton from an externally replaced cookie file. Rotation
+    must run on the NEW client — the old code took the reference before the
+    lock and would rotate (and persist!) the stale jar over the fresh dump.
+    """
+    cookie_file = tmp_path / "cookies.json"
+    _write_cookies(cookie_file, "v1")
+    monkeypatch.setattr(server, "_cookie_file", str(cookie_file))
+
+    old = server._get_client()
+    assert old.get_cookie("__Secure-1PSID") == "v1"
+    # Arm the reload: external replacement with a strictly newer mtime.
+    _write_cookies(cookie_file, "v2", newer_by_seconds=5)
+
+    rotated_on: list = []
+
+    def fake_rotate(self, force=False, skip_if_fresh=False, cookie_file=None):
+        rotated_on.append(self)
+        return True
+
+    monkeypatch.setattr(GeminiWebClient, "rotate_cookies", fake_rotate)
+
+    started = threading.Event()
+
+    def rotate_worker() -> None:
+        started.set()
+        server._rotate_once()  # parks at the lock door (main holds the lock)
+
+    with server._GENERATE_LOCK:
+        thread = threading.Thread(target=rotate_worker)
+        thread.start()
+        started.wait()
+        time.sleep(0.05)  # let the worker reach the lock door
+        # Hot-reload while the rotator waits: same RLock -> re-entrant entry,
+        # exactly what a concurrent _maybe_reload_client call would do.
+        assert server._maybe_reload_client() is True
+        new = server._get_client()
+        assert new is not old
+        assert new.get_cookie("__Secure-1PSID") == "v2"
+    # Lock released -> the rotator proceeds; it must see the NEW singleton.
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    assert len(rotated_on) == 1
+    assert rotated_on[0] is server._get_client()  # the in-lock latest client
+    assert rotated_on[0] is not old
+    assert rotated_on[0].get_cookie("__Secure-1PSID") == "v2"
