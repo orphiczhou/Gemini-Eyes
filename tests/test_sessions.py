@@ -140,3 +140,46 @@ def test_thinking_high_passes_through(chat_stub):
     )
     assert resp.status_code == 200
     assert chat_stub.captured[0]["thinking"] == "高"
+
+
+# ---------------------------------------------------------------------------
+# 1.4 model_key normalization: the gemini- prefix must not break the chain
+# ---------------------------------------------------------------------------
+
+
+def test_model_key_prefix_normalized_across_rounds(chat_stub):
+    """Round 1 names the model explicitly, round 2 omits it: same fingerprint."""
+    r1 = _chat({"model": "gemini-argon", "messages": [{"role": "user", "content": "u1"}]})
+    assert r1.status_code == 200
+    r2 = _chat(
+        {
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "u2"},
+            ]
+        }
+    )
+    assert r2.status_code == 200
+    # chain hit: only the last user turn goes upstream, metadata is reused
+    assert chat_stub.captured[1]["prompt"] == "u2"
+    assert chat_stub.captured[1]["meta"] is not None
+    assert chat_stub.captured[1]["meta"][0] == "c_1"
+
+
+def test_model_key_switch_breaks_chain(chat_stub):
+    r1 = _chat({"model": "gemini-argon", "messages": [{"role": "user", "content": "u1"}]})
+    assert r1.status_code == 200
+    r2 = _chat(
+        {
+            "model": "gemini-pro",
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "u2"},
+            ],
+        }
+    )
+    # different model scope -> miss -> full transcript, new conversation
+    assert chat_stub.captured[1]["meta"] is None
+    assert "[user]\nu1" in chat_stub.captured[1]["prompt"]

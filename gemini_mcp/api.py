@@ -415,7 +415,11 @@ async def _chat(request: Request) -> JSONResponse:
         )
 
     texts = _messages_to_texts(messages)
-    model_key = model_name or f"gemini-{DEFAULT_MODEL}"
+    # Fingerprint scope: the normalized catalog name (no gemini- prefix), so
+    # "gemini-argon" and an unset model hash identically and the chain stays
+    # intact across clients that toggle the prefix. Legacy table entries with
+    # the old prefixed keys simply age out via the 90-min TTL.
+    model_key = model_name or DEFAULT_MODEL
     # Session resolution: explicit id wins; otherwise fingerprint the history
     # BEFORE the last user turn (the next request's parent key equals this
     # turn's child key — see server.session_key). Miss → fresh conversation.
@@ -436,7 +440,7 @@ async def _chat(request: Request) -> JSONResponse:
     else:
         meta = _metadata_for(conv_id, resp_id) if conv_id else None
     if body.get("stream") is True or body.get("stream") == "true":
-        return _chat_stream(body, prompt, meta, model_name, thinking, texts)
+        return _chat_stream(body, prompt, meta, model_name, thinking, texts, model_key)
     try:
         result = await run_in_threadpool(
             _generate_serialized, prompt, meta, None, model_name, thinking
@@ -464,10 +468,15 @@ def _chat_stream(
     model_name: Optional[str],
     thinking: Optional[Union[int, str]],
     texts: Optional[list[str]] = None,
+    model_key: Optional[str] = None,
 ) -> StreamingResponse:
     """SSE stream: role frame, content/thinking deltas, ping keep-alives when
     the upstream stalls, final frame with the gemini extension, then [DONE].
-    Client disconnect cancels the upstream call at the next frame boundary."""
+    Client disconnect cancels the upstream call at the next frame boundary.
+
+    ``model_key`` is the fingerprint-scope model name from ``_chat`` — it must
+    be threaded in explicitly (a bare module-global lookup here once raised
+    NameError at the register step of every streamed turn)."""
     requested_model = str(body.get("model") or f"gemini-{DEFAULT_MODEL}")
     client = _get_client()
     cancel = __import__("threading").Event()
@@ -519,7 +528,7 @@ def _chat_stream(
                     _remember(result)
                     if texts is not None:
                         clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
-                        conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key or f"gemini-{DEFAULT_MODEL}"))
+                        conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key or DEFAULT_MODEL))
                     yield frame(
                         {},
                         "stop",
