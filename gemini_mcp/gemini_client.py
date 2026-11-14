@@ -14,12 +14,15 @@ browser profile (see cookie_extractor.py).
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import mimetypes
 import os
+import queue
 import random
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,6 +32,57 @@ from typing import Any, Callable, Iterator, Optional, Union
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Single-writer lock for the shared requests.Session: generate() calls (any
+# entry point — MCP tools, REST chat, REST streaming) and the account RPCs
+# must not race on the cookie jar / reqid counters. Server modules import
+# this same lock instance.
+GENERATE_LOCK = threading.RLock()
+
+# --- streaming delta helpers (ported from the reference web-api client) ---
+
+
+def get_clean_text(s: str) -> str:
+    """Drop the transient trailing code-fence and backslash-escaped markdown
+    markers the web stream flickers with between frames."""
+    if not s:
+        return ""
+    s = s.removesuffix("\n```")
+    return re.sub(r"\\+[`*_~].*$", "", s)
+
+
+def get_delta_by_fp_len(new_raw: str, last_sent_clean: str, is_final: bool) -> tuple[str, str]:
+    """Diff a full-text snapshot against what was already sent.
+
+    Frames carry cumulative snapshots, not increments. Fast path: the new
+    snapshot simply extends the sent text. When the prefix diverges (markdown
+    escapes settle, code fences open/close), align the two tails with
+    SequenceMatcher and emit whatever follows the last common block. Returns
+    ``(delta, new_clean_snapshot)``.
+    """
+    new_c = new_raw if is_final else get_clean_text(new_raw)
+    if new_c.startswith(last_sent_clean):
+        return new_c[len(last_sent_clean):], new_c
+
+    search_len = min(3000, max(1000, len(last_sent_clean)))
+    search_len = min(search_len, len(last_sent_clean), len(new_c))
+    if search_len == 0:
+        return new_c, new_c
+
+    tail_last = last_sent_clean[-search_len:]
+    tail_new = new_c[-search_len:]
+    matcher = difflib.SequenceMatcher(None, tail_last, tail_new)
+    blocks = [b for b in matcher.get_matching_blocks() if b.size > 0]
+    if blocks:
+        match_end = blocks[-1].b + blocks[-1].size
+        return tail_new[match_end:], new_c
+
+    matcher = difflib.SequenceMatcher(None, last_sent_clean, new_c)
+    blocks = [b for b in matcher.get_matching_blocks() if b.size > 0]
+    if blocks:
+        match_end = blocks[-1].b + blocks[-1].size
+        return new_c[match_end:], new_c
+    return new_c, new_c
 
 BASE_URL = "https://gemini.google.com"
 INIT_URL = f"{BASE_URL}/app"
@@ -856,9 +910,101 @@ class GeminiWebClient:
                     self._record_fallback(plan, plans[index], exc.code)
                     continue
                 raise
+            result = self._recover_incomplete(result)
             result.elapsed = time.time() - start
             return result
         raise last_error  # pragma: no cover - plans is never empty
+
+    def _recover_incomplete(self, result: GenerationResult) -> GenerationResult:
+        """Recover answers from conversation history when a stream ended
+        without a completion marker (Google silently cuts some streams even
+        though the full answer was persisted on its side).
+
+        Only acts when we captured partial text and the history holds a
+        longer model turn for the same conversation; Deep Think placeholders
+        (history still shows the same placeholder) are left untouched.
+        """
+        if result.completed or not result.conversation_id or not result.text:
+            return result
+        try:
+            history = self.read_conversation(result.conversation_id, limit=2)
+        except GeminiWebError:
+            return result  # diagnostics only — never mask the partial answer
+        best = ""
+        for turn in history.get("turns", []):
+            if turn.get("role") == "model":
+                text = str(turn.get("text") or "")
+                if len(text) > len(best):
+                    best = text
+        if len(best) > len(result.text):
+            result.text = best
+            result.completed = True
+        return result
+
+    def generate_stream(
+        self,
+        prompt: str,
+        metadata: Optional[list[Any]] = None,
+        files: Optional[list[str]] = None,
+        model: Optional[str] = None,
+        thinking: Optional[Union[int, str]] = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield incremental deltas for one generate() call.
+
+        Events, in order:
+          {"type": "delta", "text": str, "thoughts": str}  — either field may be ""
+          {"type": "final", "result": GenerationResult}    — terminal
+
+        The blocking generate() runs on a worker thread under GENERATE_LOCK;
+        on_frame snapshots are fed through the same candidate slots the
+        non-streaming path uses and diffed into safe increments (full-snapshot
+        frames plus flicker-safe tail alignment). Errors raised on the worker
+        are re-raised on the consumer thread at the point of iteration.
+        """
+        events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        state = {"text": "", "thoughts": ""}
+
+        def on_frame(frame: Any) -> None:
+            shadow = GenerationResult()
+            try:
+                self._consume_frame(frame, shadow)
+            except GeminiWebError as exc:
+                events.put(("error", exc))
+                return
+            text_delta, _ = get_delta_by_fp_len(shadow.text, state["text"], shadow.completed)
+            thought_delta, _ = get_delta_by_fp_len(shadow.thoughts, state["thoughts"], True)
+            if text_delta or thought_delta:
+                state["text"] = shadow.text
+                state["thoughts"] = shadow.thoughts
+                events.put(("delta", (text_delta, thought_delta)))
+
+        def worker() -> None:
+            try:
+                with GENERATE_LOCK:
+                    result = self.generate(
+                        prompt,
+                        metadata=metadata,
+                        files=files,
+                        model=model,
+                        thinking=thinking,
+                        on_frame=on_frame,
+                    )
+            except BaseException as exc:  # noqa: BLE001 - re-raised on consumer
+                events.put(("error", exc))
+                return
+            events.put(("final", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            kind, payload = events.get()
+            if kind == "delta":
+                text_delta, thought_delta = payload
+                yield {"type": "delta", "text": text_delta, "thoughts": thought_delta}
+            elif kind == "error":
+                raise payload
+            else:
+                yield {"type": "final", "result": payload}
+                return
 
     def _generate_once(
         self,

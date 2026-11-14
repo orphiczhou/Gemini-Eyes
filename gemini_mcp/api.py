@@ -30,6 +30,7 @@ Design rules carried over from the feasibility review:
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import re
 import time
@@ -37,9 +38,9 @@ import uuid
 from typing import Any, Optional, Union
 
 from starlette.applications import Starlette
-from starlette.concurrency import run_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from . import usage
@@ -336,12 +337,6 @@ async def _chat(request: Request) -> JSONResponse:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return _json_error(400, "invalid_request", "'messages' must be a non-empty array")
-    if body.get("stream"):
-        return _json_error(
-            501,
-            "streaming_unsupported",
-            'SSE streaming is not implemented in this release; send "stream": false.',
-        )
 
     # Model: normalise (gemini- prefix / aliases) and validate explicitly —
     # silently swapping an unknown name for the top tier would mislead clients.
@@ -367,6 +362,8 @@ async def _chat(request: Request) -> JSONResponse:
         return _json_error(400, "invalid_request", "no user message content found in 'messages'")
 
     meta = _metadata_for(conv_id, resp_id) if conv_id else None
+    if body.get("stream"):
+        return _chat_stream(body, prompt, meta, model_name, thinking)
     try:
         result = await run_in_threadpool(
             _generate_serialized, prompt, meta, None, model_name, thinking
@@ -383,6 +380,85 @@ async def _chat(request: Request) -> JSONResponse:
     # and this path each report exactly once.
     usage.record_request(chars_in=len(prompt), chars_out=len(result.text))
     return JSONResponse(_chat_shell(str(requested_model or f"gemini-{DEFAULT_MODEL}"), prompt, result))
+
+
+def _chat_stream(
+    body: dict[str, Any],
+    prompt: str,
+    meta: Optional[list[Any]],
+    model_name: Optional[str],
+    thinking: Optional[Union[int, str]],
+) -> StreamingResponse:
+    """SSE stream: role frame, content/thinking deltas, final frame with the
+    gemini extension (conversation ids, served model), then [DONE]."""
+    requested_model = str(body.get("model") or f"gemini-{DEFAULT_MODEL}")
+    client = _get_client()
+    gen = client.generate_stream(prompt, metadata=meta, model=model_name, thinking=thinking)
+    chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    created = int(time.time())
+    sent_chars = {"out": 0}
+
+    def frame(delta: dict[str, Any], finish: Optional[str] = None, extra: Optional[dict[str, Any]] = None) -> str:
+        payload: dict[str, Any] = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": requested_model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        if extra:
+            payload["gemini"] = extra
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+    async def sse() -> Any:
+        yield frame({"role": "assistant", "content": ""})
+        try:
+            async for item in iterate_in_threadpool(gen):
+                if item["type"] == "delta":
+                    delta: dict[str, Any] = {}
+                    if item["text"]:
+                        # The FollowUp tag arrives whole inside one snapshot
+                        # frame, so scrubbing per-delta is safe (same rule as
+                        # the non-streaming body cleaner).
+                        text_delta = _FOLLOWUP_RE.sub("", item["text"])
+                        if text_delta:
+                            delta["content"] = text_delta
+                            sent_chars["out"] += len(text_delta)
+                    if item["thoughts"]:
+                        delta["reasoning_content"] = item["thoughts"]
+                    if delta:
+                        yield frame(delta)
+                else:
+                    result = item["result"]
+                    usage.record_request(chars_in=len(prompt), chars_out=len(result.text))
+                    yield frame(
+                        {},
+                        "stop",
+                        {
+                            "conversation_id": result.conversation_id,
+                            "response_id": result.response_id,
+                            "candidate_id": result.candidate_id,
+                            "served_model": result.model,
+                            "completed": result.completed,
+                        },
+                    )
+        except GeminiWebError as exc:
+            usage.record_error()
+            error = _gemini_error_response(exc)
+            yield "data: " + json.dumps(json.loads(error.body.decode("utf-8")), ensure_ascii=False) + "\n\n"
+        except Exception:  # noqa: BLE001 - never leak internals into the stream
+            usage.record_error()
+            yield (
+                'data: {"error": {"message": "unexpected server failure", '
+                '"type": "internal_error", "code": "internal_error"}}\n\n'
+            )
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        sse(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _chat_shell(requested_model: str, prompt: str, result: Any) -> dict[str, Any]:

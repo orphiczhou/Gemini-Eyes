@@ -49,6 +49,7 @@ from .gemini_client import (
     DEFAULT_MODEL,
     DEFAULT_MODEL_FALLBACK_CHAIN,
     DEFAULT_THINKING,
+    GENERATE_LOCK,
     MediaRef,
     MODEL_ALIASES,
     MODEL_CATALOG,
@@ -75,9 +76,10 @@ _ROTATE_INTERVAL = 25 * 60
 
 # Single-cookie single-writer: the web session must not be driven
 # concurrently (review-20261102 P1-1). stdio was naturally serial; both the
-# HTTP MCP tools and the REST layer now share this process-wide lock around
-# generate() calls.
-_GENERATE_LOCK = threading.Lock()
+# HTTP MCP tools, the REST layer and streaming workers share ONE lock
+# instance owned by the client module (also covering account RPCs and the
+# rotation thread).
+_GENERATE_LOCK = GENERATE_LOCK
 
 
 class _TokenAuthMiddleware:
