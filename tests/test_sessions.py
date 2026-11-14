@@ -144,6 +144,72 @@ def test_thinking_high_passes_through(chat_stub):
 
 
 # ---------------------------------------------------------------------------
+# 1.8 Message sanitization: tool traffic never reaches prompts or fingerprints
+# ---------------------------------------------------------------------------
+
+
+def test_tool_history_stays_out_of_transcript_and_chain(chat_stub):
+    """A tool-speaking agent's replay must chain like a plain chat: tool
+    roles/payloads vanish from the prompt, the fingerprint ignores them."""
+    r1 = _chat({"messages": [{"role": "user", "content": "list files"}]})
+    assert r1.status_code == 200
+
+    r2 = _chat(
+        {
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "run_ls", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "TOOL-OUTPUT-PAYLOAD", "tool_call_id": "call_1"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "now delete one"},
+            ]
+        }
+    )
+    assert r2.status_code == 200
+    prompt = chat_stub.captured[1]["prompt"]
+    # chain hit: sanitized history equals the plain-chat history
+    assert prompt == "now delete one"
+    assert chat_stub.captured[1]["meta"] is not None
+    assert chat_stub.captured[1]["meta"][0] == "c_1"
+    # nothing tool-shaped leaked upstream
+    assert "TOOL-OUTPUT-PAYLOAD" not in prompt
+    assert "run_ls" not in prompt
+    assert "tool" not in prompt.lower()
+
+
+def test_all_tool_messages_rejected_as_empty(chat_stub):
+    resp = _chat({"messages": [{"role": "tool", "content": "only tool output"}]})
+    assert resp.status_code == 400
+    assert chat_stub.captured == []
+
+
+def test_request_level_tool_fields_accepted_but_ignored(chat_stub):
+    resp = _chat(
+        {
+            "model": "gemini-pro",
+            "tools": [{"type": "function", "function": {"name": "run_ls"}}],
+            "tool_choice": "auto",
+            "functions": [{"name": "legacy_fn"}],
+            "function_call": "none",
+            "parallel_tool_calls": False,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    assert resp.status_code == 200
+    assert chat_stub.captured[0]["prompt"] == "hi"
+
+
+# ---------------------------------------------------------------------------
 # 1.4 model_key normalization: the gemini- prefix must not break the chain
 # ---------------------------------------------------------------------------
 

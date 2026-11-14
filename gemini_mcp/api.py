@@ -195,6 +195,56 @@ def _content_to_text(content: Any) -> str:
     return ""
 
 
+# Roles that carry pure tool traffic: dropped entirely by sanitization.
+_TOOL_ROLES = frozenset({"tool", "function"})
+# Assistant-only fields describing tool invocations (not chat content).
+_TOOL_CALL_FIELDS = ("tool_calls", "function_call")
+# Request-level tool fields the facade accepts but ignores (no tool channel
+# on the web backend); kept as a list for documentation/tests.
+IGNORED_TOOL_FIELDS = ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls")
+
+
+def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the chat-only view of an OpenAI messages array.
+
+    The web backend has no tool channel, so tool-speaking clients (OpenAI
+    SDK, DSH, agents with function calling) must not have their tool traffic
+    leak into prompts or fingerprints:
+
+    * ``role in ("tool", "function")`` messages are dropped entirely;
+    * assistant messages lose ``tool_calls`` / ``function_call``; when no
+      textual content remains the whole message is dropped;
+    * request-level ``tools`` / ``tool_choice`` / ``functions`` /
+      ``function_call`` / ``parallel_tool_calls`` fields are accepted but
+      ignored (advertised via ``capabilities.function_calling=false``).
+
+    ``_chat`` applies this ONCE at the entry, before any fingerprint
+    (``_messages_to_texts``) or prompt (``_messages_to_prompt``) is derived —
+    both only ever see the sanitized view, which keeps the conversation chain
+    deterministic across turns even when tool traffic comes and goes.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user"))
+        if role in _TOOL_ROLES:
+            continue
+        if role != "assistant":
+            out.append(message)
+            continue
+        if any(field in message for field in _TOOL_CALL_FIELDS):
+            message = {
+                key: value
+                for key, value in message.items()
+                if key not in _TOOL_CALL_FIELDS
+            }
+        if not _content_to_text(message.get("content")).strip():
+            continue  # assistant turn was pure tool traffic — nothing to say
+        out.append(message)
+    return out
+
+
 def _messages_to_prompt(messages: list[dict[str, Any]], continue_conversation: bool) -> str:
     """Build the single web prompt from an OpenAI messages array.
 
@@ -391,6 +441,14 @@ async def _chat(request: Request) -> JSONResponse:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return _json_error(400, "invalid_request", "'messages' must be a non-empty array")
+
+    # Single sanitization choke point (see _sanitize_messages): everything
+    # below — model checks, fingerprint, prompt, registration — operates on
+    # the chat-only view, so tool traffic can never leak into prompts nor
+    # destabilize the conversation chain. Request-level tool fields
+    # (tools/tool_choice/functions/function_call/parallel_tool_calls) are
+    # accepted but ignored.
+    messages = _sanitize_messages(messages)
 
     # Model: normalise (gemini- prefix / aliases) and validate explicitly —
     # silently swapping an unknown name for the top tier would mislead clients.

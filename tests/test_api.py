@@ -66,6 +66,71 @@ def test_messages_parts_array_content():
 
 
 # ---------------------------------------------------------------------------
+# message sanitization (tool traffic -> chat-only view)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_drops_tool_roles_and_tool_calls():
+    from gemini_mcp.api import _sanitize_messages
+
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run_ls", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "content": "TOOL-OUTPUT-PAYLOAD", "tool_call_id": "call_1"},
+        {"role": "assistant", "content": "real answer"},
+        {"role": "function", "content": "legacy function payload"},
+    ]
+    out = _sanitize_messages(msgs)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[-1]["content"] == "real answer"
+    # the caller's list is never mutated
+    assert "tool_calls" in msgs[2]
+
+
+def test_sanitize_assistant_with_text_and_tool_calls_keeps_text():
+    from gemini_mcp.api import _sanitize_messages
+
+    msgs = [
+        {
+            "role": "assistant",
+            "content": "answer plus a call",
+            "tool_calls": [{"id": "c", "function": {"name": "f"}}],
+            "function_call": {"name": "g"},
+        }
+    ]
+    out = _sanitize_messages(msgs)
+    assert len(out) == 1
+    assert out[0]["content"] == "answer plus a call"
+    assert "tool_calls" not in out[0]
+    assert "function_call" not in out[0]
+
+
+def test_sanitize_all_tool_history_becomes_empty():
+    from gemini_mcp.api import _sanitize_messages
+
+    assert _sanitize_messages([{"role": "tool", "content": "x"}]) == []
+    assert _sanitize_messages(
+        [{"role": "assistant", "content": "", "tool_calls": [{"id": "c"}]}]
+    ) == []
+    # non-assistant empty messages keep the historical pass-through behaviour
+    assert _sanitize_messages([{"role": "user", "content": ""}]) == [{"role": "user", "content": ""}]
+
+
+def test_sanitize_non_dict_entries_skipped():
+    from gemini_mcp.api import _sanitize_messages
+
+    out = _sanitize_messages(["junk", {"role": "user", "content": "hi"}, None])
+    assert out == [{"role": "user", "content": "hi"}]
+
+
+# ---------------------------------------------------------------------------
 # thinking resolution
 # ---------------------------------------------------------------------------
 
