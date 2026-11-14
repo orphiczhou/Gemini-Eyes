@@ -44,6 +44,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from . import usage
+from .eventlog import event_logger
 from .gemini_client import (
     DEFAULT_MODEL,
     DEFAULT_THINKING,
@@ -64,6 +65,7 @@ from .server import (
     _usage_payload,
     conv_lookup,
     conv_register,
+    session_key,
 )
 
 _CREATED = int(time.time())
@@ -99,6 +101,18 @@ def _json_error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
         {"error": {"message": message, "type": "invalid_request_error", "code": code}},
         status_code=status,
+    )
+
+
+def _log_request_error(model: str, resp: JSONResponse) -> None:
+    """Event-log one failed request: error code + HTTP status only (sanitized)."""
+    code = "?"
+    try:
+        code = json.loads(resp.body.decode("utf-8")).get("error", {}).get("code", "?")
+    except Exception:  # noqa: BLE001 - logging must never raise
+        pass
+    event_logger().info(
+        "request_error model=%s code=%s http_status=%d", model, code, resp.status_code
     )
 
 
@@ -439,23 +453,53 @@ async def _chat(request: Request) -> JSONResponse:
             meta[1] = resp_id
     else:
         meta = _metadata_for(conv_id, resp_id) if conv_id else None
-    if body.get("stream") is True or body.get("stream") == "true":
-        return _chat_stream(body, prompt, meta, model_name, thinking, texts, model_key)
+
+    # Sanitized event log: ids, model labels and LENGTHS only — never prompt
+    # or reply bodies (see eventlog.py red lines).
+    ev = event_logger()
+    started = time.time()
+    fp_input = texts if conv_id else texts[:-1]
+    fp8 = session_key(fp_input, model_key)[:8] if fp_input else "-"
+    if rec is not None:
+        hit_cid = str((rec.metadata or [""])[0] or "?")
+        ev.info("session_hit conversation_id=%s fingerprint=%s", hit_cid, fp8)
+    else:
+        ev.info("session_miss fingerprint=%s", fp8)
+    will_stream = body.get("stream") is True or body.get("stream") == "true"
+    ev.info(
+        "request_start model=%s stream=%s chars_in=%d", model_key, will_stream, len(prompt)
+    )
+
+    if will_stream:
+        return _chat_stream(body, prompt, meta, model_name, thinking, texts, model_key, started)
     try:
         result = await run_in_threadpool(
             _generate_serialized, prompt, meta, None, model_name, thinking
         )
     except GeminiWebError as exc:
         usage.record_error()
-        return _gemini_error_response(exc)
+        resp = _gemini_error_response(exc)
+        _log_request_error(model_key, resp)
+        return resp
     except Exception:  # noqa: BLE001 - never leak internals to the client
         usage.record_error()
+        # Traceback frames only (no payload data) — the one branch where the
+        # cause is unknown and operators need it in the event log.
+        ev.exception("request_error model=%s code=internal_error http_status=500", model_key)
         return _json_error(500, "internal_error", "unexpected server failure")
 
     # REST path counts its own traffic here; _generate_serialized stays
     # count-free so the MCP tool path (which counts in gemini_send_message)
     # and this path each report exactly once.
     usage.record_request(chars_in=len(prompt), chars_out=len(result.text))
+    ev.info(
+        "request_end model=%s elapsed=%.2f chars_in=%d chars_out=%d conversation_id=%s",
+        model_key,
+        time.time() - started,
+        len(prompt),
+        len(result.text),
+        result.conversation_id,
+    )
     clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
     conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key))
     return JSONResponse(_chat_shell(str(requested_model or f"gemini-{DEFAULT_MODEL}"), prompt, result))
@@ -469,6 +513,7 @@ def _chat_stream(
     thinking: Optional[Union[int, str]],
     texts: Optional[list[str]] = None,
     model_key: Optional[str] = None,
+    started: Optional[float] = None,
 ) -> StreamingResponse:
     """SSE stream: role frame, content/thinking deltas, ping keep-alives when
     the upstream stalls, final frame with the gemini extension, then [DONE].
@@ -476,7 +521,8 @@ def _chat_stream(
 
     ``model_key`` is the fingerprint-scope model name from ``_chat`` — it must
     be threaded in explicitly (a bare module-global lookup here once raised
-    NameError at the register step of every streamed turn)."""
+    NameError at the register step of every streamed turn). ``started`` is the
+    request-start timestamp for the sanitized event log."""
     requested_model = str(body.get("model") or f"gemini-{DEFAULT_MODEL}")
     client = _get_client()
     cancel = __import__("threading").Event()
@@ -486,6 +532,8 @@ def _chat_stream(
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     sent_chars = {"out": 0}
+    ev = event_logger()
+    started = started if started is not None else float(created)
 
     def frame(delta: dict[str, Any], finish: Optional[str] = None, extra: Optional[dict[str, Any]] = None) -> str:
         payload: dict[str, Any] = {
@@ -526,6 +574,15 @@ def _chat_stream(
                     from .server import _remember
 
                     _remember(result)
+                    ev.info(
+                        "request_end model=%s stream=true elapsed=%.2f "
+                        "chars_in=%d chars_out=%d conversation_id=%s",
+                        model_key or "-",
+                        time.time() - started,
+                        len(prompt),
+                        len(result.text),
+                        result.conversation_id,
+                    )
                     if texts is not None:
                         clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
                         conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key or DEFAULT_MODEL))
@@ -543,9 +600,14 @@ def _chat_stream(
         except GeminiWebError as exc:
             usage.record_error()
             error = _gemini_error_response(exc)
+            _log_request_error(model_key or "-", error)
             yield "data: " + json.dumps(json.loads(error.body.decode("utf-8")), ensure_ascii=False) + "\n\n"
         except Exception:  # noqa: BLE001 - never leak internals into the stream
             usage.record_error()
+            ev.info(
+                "request_error model=%s stream=true code=internal_error http_status=200",
+                model_key or "-",
+            )
             yield (
                 'data: {"error": {"message": "unexpected server failure", '
                 '"type": "internal_error", "code": "internal_error"}}\n\n'

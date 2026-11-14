@@ -962,15 +962,19 @@ class GeminiWebClient:
         code: Optional[int],
     ) -> None:
         """Note one model-chain degradation for the usage/telemetry surface."""
+        from_label = from_plan.label if from_plan is not None else "legacy"
+        to_label = to_plan.label if to_plan is not None else "legacy"
         self.fallback_events.append(
             {
                 "ts": round(time.time(), 3),
                 "code": code,
-                "from": from_plan.label if from_plan is not None else "legacy",
-                "to": to_plan.label if to_plan is not None else "legacy",
+                "from": from_label,
+                "to": to_label,
             }
         )
         del self.fallback_events[:-50]  # keep the tail, cap memory
+        # Sanitized event log (labels + code only, never payloads).
+        logger.info("model_fallback from=%s to=%s code=%s", from_label, to_label, code)
 
     def generate(
         self,

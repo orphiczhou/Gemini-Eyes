@@ -29,3 +29,6 @@ pytest-of-sir_c/
 *.bak
 *.pre-model.bak
 *.pre-argon.bak
+
+# Daemon event log (sanitized, rotating)
+.logs/

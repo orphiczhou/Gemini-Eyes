@@ -1052,6 +1052,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         level=logging.DEBUG if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Sanitized daemon event log (rotating file, metadata only — see
+    # eventlog.py). Best effort: a broken log path must not kill the daemon.
+    from .eventlog import configure_event_logging
+
+    try:
+        event_path = configure_event_logging()
+    except OSError as e:
+        event_path = None
+        log.warning("event log unavailable: %s", e)
+    if event_path is not None:
+        log.info("event log configured at %s", event_path)
     if args.cookie_file:
         os.environ["GEMINI_COOKIE_FILE"] = args.cookie_file
     _cookie_file = args.cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
