@@ -1085,3 +1085,138 @@ class _StatusResponse:
     def __exit__(self, *a):
         return False
 
+
+# ---------------------------------------------------------------------------
+# Stream watchdog (dual threshold: stall / total budget)
+# ---------------------------------------------------------------------------
+
+from gemini_mcp.gemini_client import (  # noqa: E402
+    DEFAULT_STALL_TIMEOUT,
+    DEFAULT_TOTAL_TIMEOUT,
+    stream_watchdog_timeouts,
+)
+
+
+class _SlowStreamResponse:
+    """200 response whose body arrives as (delay, chunk) pairs."""
+
+    status_code = 200
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def iter_content(self, chunk_size=0, decode_unicode=False):
+        for delay, chunk in self._chunks:
+            if delay:
+                time.sleep(delay)
+            yield chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _watchdog_client(monkeypatch, response_factory, **kwargs):
+    posts: list[str] = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            posts.append(url)
+            return response_factory(len(posts))
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({}, **kwargs)
+    return client, posts
+
+
+def test_watchdog_default_thresholds():
+    assert stream_watchdog_timeouts() == (DEFAULT_STALL_TIMEOUT, DEFAULT_TOTAL_TIMEOUT)
+    assert DEFAULT_STALL_TIMEOUT == 120.0
+    assert DEFAULT_TOTAL_TIMEOUT == 450.0
+
+
+def test_watchdog_stall_aborts_silent_stream(monkeypatch):
+    """Empty chunks trickling in after a long silence trip the stall budget."""
+    monkeypatch.setenv("GEMINI_STALL_TIMEOUT", "0.05")
+    monkeypatch.setenv("GEMINI_TOTAL_TIMEOUT", "30")
+    # first chunk immediately, second only after 0.3s of silence
+    client, posts = _watchdog_client(
+        monkeypatch, lambda n: _SlowStreamResponse([(0, ""), (0.3, "")]), model="legacy"
+    )
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("ping")
+    assert exc.value.stall is True
+    assert "no stream progress" in str(exc.value)
+    assert exc.value.is_retryable is False
+    assert len(posts) == 1  # stall errors never re-POST
+
+
+def test_watchdog_total_budget_aborts_trickling_stream(monkeypatch):
+    """A stream that keeps making slow progress still dies at the total cap."""
+    monkeypatch.setenv("GEMINI_STALL_TIMEOUT", "30")  # stall effectively off
+    monkeypatch.setenv("GEMINI_TOTAL_TIMEOUT", "0.05")
+    client, posts = _watchdog_client(
+        monkeypatch,
+        lambda n: _SlowStreamResponse([(0, "x"), (0.2, "y")]),
+        model="legacy",
+    )
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("ping")
+    assert exc.value.stall is True
+    assert "total budget" in str(exc.value)
+    assert len(posts) == 1
+
+
+def test_watchdog_read_timeout_is_stall_not_transport(monkeypatch):
+    """A blocked socket (read timeout) is a stall — unlike a mid-stream reset."""
+    import requests as requests_module
+
+    monkeypatch.delenv("GEMINI_STALL_TIMEOUT", raising=False)
+    monkeypatch.delenv("GEMINI_TOTAL_TIMEOUT", raising=False)
+
+    def raise_read_timeout(n):
+        raise requests_module.ReadTimeout("read timed out")
+
+    client, posts = _watchdog_client(monkeypatch, raise_read_timeout, model="legacy")
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("ping")
+    assert exc.value.stall is True
+    assert exc.value.transport is False
+    assert exc.value.is_retryable is False
+    assert len(posts) == 1  # not retried, unlike plain transport errors
+
+
+def test_watchdog_env_disable_restores_plain_timeout(monkeypatch):
+    """GEMINI_STALL_TIMEOUT=0 disables the clamp: the old scalar timeout stays."""
+    monkeypatch.setenv("GEMINI_STALL_TIMEOUT", "0")
+    captured = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            captured["timeout"] = timeout
+            return FakeResponse([_stream_frame(text="ok", status=2)])
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({}, model="legacy", timeout=42.0)
+    client.generate("ping")
+    # read timeout falls back to the client timeout instead of the stall clamp
+    assert captured["timeout"] == (42.0, 42.0)
+

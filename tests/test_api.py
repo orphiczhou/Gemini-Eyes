@@ -4,6 +4,8 @@ All offline: pure payload helpers, the error translation table and the
 per-request fallback-chain rebuild. No network, no real client session.
 """
 
+import json
+
 from gemini_mcp.api import (
     _ERROR_MAP,
     _gemini_error_response,
@@ -93,6 +95,17 @@ def test_error_response_maps_all_codes():
 def test_error_response_transport_and_generic():
     assert _gemini_error_response(GeminiWebError("x", transport=True)).status_code == 502
     assert _gemini_error_response(GeminiWebError("x")).status_code == 503
+
+
+def test_error_response_stall_maps_to_504():
+    resp = _gemini_error_response(GeminiWebError("upstream silent", stall=True))
+    assert resp.status_code == 504
+    body = json.loads(resp.body.decode("utf-8"))
+    assert body["error"]["code"] == "upstream_stalled"
+    assert "Ultra-only" in body["error"]["message"]
+    # transport=True + stall=True still reports as a stall (watchdog verdict wins)
+    both = _gemini_error_response(GeminiWebError("x", transport=True, stall=True))
+    assert both.status_code == 504
 
 
 # ---------------------------------------------------------------------------

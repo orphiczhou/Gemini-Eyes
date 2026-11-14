@@ -263,6 +263,35 @@ TRANSIENT_ERROR_CODES = frozenset({1013})
 TRANSIENT_RETRY_ATTEMPTS = 2
 TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (0.8, 2.0)
 
+# Stream watchdog (dual threshold). An upstream that accepts the POST but
+# never answers (observed with Ultra-only models on a Pro plan) would block
+# the generate lock forever: the socket reads stay open, frames never come.
+# Two budgets bound that, both env-tunable and read per request so tests (and
+# operators) can override without rebuilding the client:
+#   GEMINI_STALL_TIMEOUT  seconds without a single byte on the socket (120)
+#   GEMINI_TOTAL_TIMEOUT  total seconds for one StreamGenerate round trip (450)
+# A value <= 0 disables the respective threshold.
+DEFAULT_STALL_TIMEOUT = 120.0
+DEFAULT_TOTAL_TIMEOUT = 450.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def stream_watchdog_timeouts() -> tuple[float, float]:
+    """(stall_seconds, total_seconds) for the StreamGenerate watchdog."""
+    return (
+        _env_float("GEMINI_STALL_TIMEOUT", DEFAULT_STALL_TIMEOUT),
+        _env_float("GEMINI_TOTAL_TIMEOUT", DEFAULT_TOTAL_TIMEOUT),
+    )
+
 
 @dataclass(frozen=True)
 class ModelSetting:
@@ -405,18 +434,38 @@ class GeminiWebError(RuntimeError):
     ``transport=True`` marks an error that came from the HTTP layer itself
     (timeout, connection reset, mid-stream disconnect) rather than from an
     HTTP status or a server error code; those are retried with backoff.
+
+    ``stall=True`` marks a watchdog abort: the StreamGenerate socket made no
+    progress for ``GEMINI_STALL_TIMEOUT`` seconds (default 120) or blew the
+    ``GEMINI_TOTAL_TIMEOUT`` total budget (default 450). Retrying an upstream
+    that ignores us would only stall again, so stall errors are never retried.
+
+    ``retryable`` forces the verdict either way — used to make a
+    client-disconnect cancel final (no retry, the consumer is gone).
     """
 
     def __init__(
-        self, message: str, code: Optional[int] = None, *, transport: bool = False
+        self,
+        message: str,
+        code: Optional[int] = None,
+        *,
+        transport: bool = False,
+        stall: bool = False,
+        retryable: Optional[bool] = None,
     ):
         super().__init__(message)
         self.code = code
         self.transport = transport
+        self.stall = stall
+        self._retryable = retryable
 
     @property
     def is_retryable(self) -> bool:
         """True for failures worth retrying unchanged (1013 / 5xx / transport)."""
+        if self._retryable is not None:
+            return self._retryable
+        if self.stall:
+            return False  # a stalled upstream will stall again
         if self.transport:
             return True
         if self.code in TRANSIENT_ERROR_CODES:
@@ -1122,23 +1171,37 @@ class GeminiWebClient:
         headers: Optional[dict[str, str]],
         on_frame: Optional[Callable[[Any], None]],
     ) -> GenerationResult:
-        """One StreamGenerate POST + incremental frame consumption."""
+        """One StreamGenerate POST + incremental frame consumption.
+
+        Guarded by the dual-threshold watchdog (see ``stream_watchdog_timeouts``):
+        a socket read timeout is clamped to the stall threshold, so even a
+        fully blocked read wakes up; chunks that do arrive are checked against
+        both budgets. Any breach aborts the stream with ``GeminiWebError```
+        marked ``stall=True`` (never retried — the REST layer maps it to 504).
+        """
         result = GenerationResult()
         params = {**self._params(), "_reqid": self._next_reqid()}
         body = {
             "at": self.access_token,
             "f.req": json.dumps([None, json.dumps(inner)]),
         }
+        stall_timeout, total_timeout = stream_watchdog_timeouts()
+        # (connect, read): clamp the read timeout to the stall budget so a
+        # silent upstream surfaces as requests.ReadTimeout instead of blocking
+        # for the full client timeout. Disabled watchdog -> old behaviour.
+        read_timeout = min(self.timeout, stall_timeout) if stall_timeout > 0 else self.timeout
         request: dict[str, Any] = {
             "params": params,
             "data": body,
             "stream": True,
-            "timeout": self.timeout,
+            "timeout": (self.timeout, read_timeout),
         }
         if headers:
             request["headers"] = headers
 
         parser = FrameParser()
+        started = time.monotonic()
+        last_progress = time.monotonic()
         try:
             with self.session.post(GENERATE_URL, **request) as resp:
                 if resp.status_code != 200:
@@ -1148,8 +1211,22 @@ class GeminiWebClient:
                         code=resp.status_code,
                     )
                 for chunk in resp.iter_content(chunk_size=16384, decode_unicode=True):
+                    now = time.monotonic()
+                    if total_timeout > 0 and now - started >= total_timeout:
+                        raise GeminiWebError(
+                            f"StreamGenerate aborted: total budget of "
+                            f"{total_timeout:g}s exceeded without a completed answer",
+                            stall=True,
+                        )
+                    if stall_timeout > 0 and now - last_progress >= stall_timeout:
+                        raise GeminiWebError(
+                            f"StreamGenerate aborted: no stream progress for "
+                            f"{stall_timeout:g}s (upstream stalled)",
+                            stall=True,
+                        )
                     if not chunk:
                         continue
+                    last_progress = now
                     # feed() returns only the frames parsed from *this* chunk;
                     # replaying accumulated history here duplicated media and
                     # on_frame callbacks and inflated raw_frames.
@@ -1158,6 +1235,15 @@ class GeminiWebClient:
                         if on_frame:
                             on_frame(frame)
                         self._consume_frame(frame, result)
+        except requests.ReadTimeout as exc:
+            # Zero bytes on the socket for the whole stall window: the model
+            # was accepted but is being silently queued (Ultra-only on a lower
+            # plan) or the backend hung. Not a transport blip — do not retry.
+            raise GeminiWebError(
+                f"StreamGenerate stalled: no bytes for {read_timeout:g}s; the "
+                "model may be unavailable on this plan (e.g. Carbon/Ultra-only)",
+                stall=True,
+            ) from exc
         except requests.RequestException as exc:
             # Mid-stream disconnect / read timeout: the stream is gone, the
             # partial result is discarded and _run_with_resilience retries.

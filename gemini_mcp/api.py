@@ -102,7 +102,15 @@ def _json_error(status: int, code: str, message: str) -> JSONResponse:
 
 def _gemini_error_response(exc: GeminiWebError) -> JSONResponse:
     """Translate GeminiWebError into a terse HTTP error (never echoing upstream text)."""
-    if exc.transport:
+    if getattr(exc, "stall", False):
+        status, code, message = (
+            504,
+            "upstream_stalled",
+            "Upstream produced no output for a long time (stalled). The model "
+            "may be unavailable on this plan (e.g. Carbon/Ultra-only); try "
+            "gemini-argon or gemini-pro (see GET /v1/models).",
+        )
+    elif exc.transport:
         status, code, message = 502, "upstream_transport", "Upstream connection failed (timeout/reset)."
     elif exc.code in _ERROR_MAP:
         status, code, message = _ERROR_MAP[exc.code]
