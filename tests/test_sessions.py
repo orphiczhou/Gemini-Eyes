@@ -210,6 +210,75 @@ def test_request_level_tool_fields_accepted_but_ignored(chat_stub):
 
 
 # ---------------------------------------------------------------------------
+# SSE streaming through api._chat_stream
+# ---------------------------------------------------------------------------
+
+
+def _chat_stream_collect(payload: dict[str, Any]) -> str:
+    """Run _chat with a streaming body and collect the full SSE text."""
+    resp = asyncio.run(api._chat(_FakeRequest(payload)))
+
+    async def collect() -> str:
+        chunks = []
+        async for c in resp.body_iterator:
+            chunks.append(c if isinstance(c, str) else c.decode("utf-8"))
+        return "".join(chunks)
+
+    return asyncio.run(collect())
+
+
+def test_stream_stall_surfaces_as_upstream_stalled(monkeypatch):
+    """A stalled upstream ends the SSE stream with the mapped 504 error."""
+    from gemini_mcp.gemini_client import GeminiWebError
+
+    class _StallClient:
+        def generate_stream(self, *args, **kwargs):
+            raise GeminiWebError("upstream silent", stall=True)
+            yield  # noqa: B901 - unreachable; makes this a generator function
+
+    monkeypatch.setattr(api, "_get_client", lambda: _StallClient())
+    body = _chat_stream_collect(
+        {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+    )
+    assert "upstream_stalled" in body
+    assert "Ultra-only" in body
+    assert body.rstrip().endswith("data: [DONE]")
+
+
+def test_stream_final_registers_session_and_chains(monkeypatch, chat_stub):
+    """A finished streamed turn registers the child key; the follow-up
+    request chains onto it (streaming counterpart of the model_key fix)."""
+
+    class _OkClient:
+        def generate_stream(self, prompt, metadata=None, model=None, thinking=None, cancel=None, **kw):
+            yield {"type": "delta", "text": "streamed ", "thoughts": ""}
+            yield {"type": "final", "result": _StubResult(text="streamed reply")}
+
+    monkeypatch.setattr(api, "_get_client", lambda: _OkClient())
+    body = _chat_stream_collect(
+        {"messages": [{"role": "user", "content": "u1"}], "stream": True}
+    )
+    assert "streamed " in body  # delta reached the wire
+    assert "[DONE]" in body
+    assert '"finish_reason": "stop"' in body
+
+    # follow-up non-streaming turn chains onto the streamed registration
+    resp = _chat(
+        {
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "streamed reply"},
+                {"role": "user", "content": "u2"},
+            ]
+        }
+    )
+    assert resp.status_code == 200
+    assert chat_stub.captured[0]["prompt"] == "u2"
+    assert chat_stub.captured[0]["meta"] is not None
+    assert chat_stub.captured[0]["meta"][0] == "c_1"
+
+
+# ---------------------------------------------------------------------------
 # 1.4 model_key normalization: the gemini- prefix must not break the chain
 # ---------------------------------------------------------------------------
 
