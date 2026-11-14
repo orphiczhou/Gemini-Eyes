@@ -1101,7 +1101,12 @@ class GeminiWebClient:
 
         def on_frame(frame: Any) -> None:
             if cancel is not None and cancel.is_set():
-                raise GeminiWebError("stream cancelled by client", transport=True)
+                # Consumer is gone: DO NOT let the resilience layer retry
+                # this — a retry would re-send the same prompt upstream on a
+                # dead connection (duplicate quota burn for nobody).
+                raise GeminiWebError(
+                    "stream cancelled by client", transport=True, retryable=False
+                )
             # Errors from error-frames must NOT be swallowed here: raising
             # lets generate()'s degradation chain / retry layer handle them
             # exactly like the non-streaming path.

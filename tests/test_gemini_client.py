@@ -1206,6 +1206,78 @@ def test_watchdog_read_timeout_is_stall_not_transport(monkeypatch):
     assert len(posts) == 1  # not retried, unlike plain transport errors
 
 
+def test_cancelled_stream_is_not_retried(monkeypatch):
+    """Client disconnect (cancel set) must abort after exactly one POST.
+
+    The old path marked the cancel error transport=True, so _run_with_resilience
+    retried it up to TRANSIENT_RETRY_ATTEMPTS times — the upstream received the
+    same prompt repeatedly for a consumer that was already gone.
+    """
+    import threading
+
+    posts: list[str] = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            posts.append(url)
+            return FakeResponse([
+                _stream_frame(text="partial answer", status=1),
+                _stream_frame(text="partial answer, more", status=2),
+            ])
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({}, model="legacy")  # single plan: any retry = another POST
+    cancel = threading.Event()
+    cancel.set()  # consumer went away before the first frame arrived
+    with pytest.raises(GeminiWebError) as exc:
+        for _item in client.generate_stream("hi", cancel=cancel):
+            pass
+    assert "cancelled" in str(exc.value)
+    assert exc.value.is_retryable is False
+    assert len(posts) == 1  # exactly one upstream POST, no retries
+
+
+def test_transport_error_without_cancel_still_retries(monkeypatch):
+    """Resilience is preserved: a mid-stream reset with a live consumer retries."""
+    import requests as requests_module
+
+    posts: list[str] = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = _session_with_cookies()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            if "StreamGenerate" not in url:
+                return _StatusResponse(200)
+            posts.append(url)
+            if len(posts) == 1:
+                raise requests_module.ConnectionError("reset mid-stream")
+            return FakeResponse([_stream_frame(text="recovered", status=2)])
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    monkeypatch.setattr("gemini_mcp.gemini_client.time.sleep", lambda s: None)
+    client = GeminiWebClient({}, model="legacy")
+    result = None
+    for item in client.generate_stream("hi"):
+        if item["type"] == "final":
+            result = item["result"]
+    assert result is not None and result.text == "recovered"
+    assert len(posts) == 2  # one reset + one successful retry
+
+
 def test_watchdog_env_disable_restores_plain_timeout(monkeypatch):
     """GEMINI_STALL_TIMEOUT=0 disables the clamp: the old scalar timeout stays."""
     monkeypatch.setenv("GEMINI_STALL_TIMEOUT", "0")
