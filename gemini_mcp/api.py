@@ -293,16 +293,21 @@ def _models_payload() -> dict[str, Any]:
             "gemini": {"note": "model-less legacy payload (web default behaviour)"},
         }
     )
-    out: dict[str, Any] = {
-        "object": "list",
-        "data": data,
-        "gemini": {
-            "default_model": f"gemini-{DEFAULT_MODEL}",
-            "default_thinking": DEFAULT_THINKING,
-            "thinking_levels": dict(THINKING_LEVELS),
-            "model_aliases": dict(MODEL_ALIASES),
+    out["gemini"]["thinking_guide"] = [
+        {"label": "低", "value": 1, "api": "同步", "note": "最快，轻任务"},
+        {"label": "中", "value": 2, "api": "同步", "note": "默认，质量/延迟平衡"},
+        {
+            "label": "高",
+            "value": 3,
+            "api": "异步占位",
+            "note": "Deep Think：首响应仅为处理中占位（completed=false），用返回的 gemini_conversation_id 轮询续聊取终稿",
         },
-    }
+    ]
+    out["gemini"]["discovered_note"] = (
+        "discovered.models 来自账号实时发现：name=界面模型名（如 4 Carbon），"
+        "display_name=界面选项名（如 高难任务），二者均可作 model 参数"
+    )
+    return out
     # Live account discovery (otAQ7b): served from the client-side cache
     # warmed by the background prewarm thread at startup. NEVER discovered
     # inline here — the RPC needs the generate lock and the network, and a

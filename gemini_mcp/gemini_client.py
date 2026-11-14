@@ -169,12 +169,17 @@ MODEL_ALIASES: dict[str, str] = {
     "3.6-flash": "flash",
     "3.5-flash": "flash",
     "lite": "flash-lite",
-    # UI display names (gemini web interface, zh-CN) as aliases — observed
-    # via model discovery 2026-11-14.
+    # UI names (gemini web interface) as aliases — from the otAQ7b roster,
+    # 2026-11-14: display_name (zh) and the model name shown under each entry.
     "快速解答": "flash-lite-basic",
     "日常帮助": "flash",
     "深度研究": "pro",
     "高难任务": "argon",
+    "3.5-flash-lite": "flash-lite",
+    "4-hydrogen": "flash",
+    "hydrogen": "flash",
+    "4-carbon": "argon",
+    "carbon": "argon",
     "legacy": "legacy",
     "default": "legacy",
     "off": "legacy",
@@ -200,14 +205,17 @@ THINKING_LEVELS: dict[str, int] = {
     "standard": 1,
     "low": 1,
     "minimal": 1,
+    "低": 1,
     "extended": 2,
     "medium": 2,
     "high": 2,
     "max": 2,
     "highest": 2,
+    "中": 2,
     "deep": 3,
     "deep_think": 3,
     "deepthink": 3,
+    "高": 3,
 }
 DEFAULT_THINKING = 2
 
@@ -269,7 +277,7 @@ class ModelSetting:
 
 
 def _normalise_model_name(raw: str) -> str:
-    key = raw.strip().lower().replace("_", "-")
+    key = raw.strip().lower().replace("_", "-").replace(" ", "-")
     if key.startswith("gemini-"):
         key = key[len("gemini-") :]
     return MODEL_ALIASES.get(key, key)
