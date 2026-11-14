@@ -102,6 +102,11 @@ class _ConvRecord:
 _conv_by_cid: dict[str, "_ConvRecord"] = {}
 _conv_by_key: dict[str, str] = {}  # fingerprint -> conversation_id
 
+# Guards the compound read/modify/write sequences on the session table
+# (register writes cid + two keys + evicts; lookup reads key -> cid -> record
+# across two dicts). RLock because conv_register calls into _conv_evict.
+_CONV_LOCK = threading.RLock()
+
 
 def session_key(texts: list[str], model: str) -> str:
     """Fingerprint an ordered history of flattened texts under one model."""
@@ -114,7 +119,13 @@ def session_key(texts: list[str], model: str) -> str:
 
 
 def _conv_evict() -> None:
-    """TTL + max-entries eviction; fingerprint keys cleaned with records."""
+    """TTL + max-entries eviction; fingerprint keys cleaned with records.
+
+    Caller must hold ``_CONV_LOCK``. Orphan fingerprint keys (pointing at a
+    conversation id that no longer has a record) are removed UNCONDITIONALLY:
+    TTL and capacity trimming above are not the only ways a cid can vanish,
+    and a stale key would chain a future request onto a dead conversation.
+    """
     now = time.time()
     stale = [cid for cid, r in _conv_by_cid.items() if now - r.updated_at > _CONV_TTL]
     for cid in stale:
@@ -124,9 +135,8 @@ def _conv_evict() -> None:
             : len(_conv_by_cid) - _CONV_MAX
         ]:
             _conv_by_cid.pop(cid, None)
-    if stale or len(_conv_by_cid) > _CONV_MAX:
-        for k in [k for k, cid in _conv_by_key.items() if cid not in _conv_by_cid]:
-            _conv_by_key.pop(k, None)
+    for k in [k for k, cid in _conv_by_key.items() if cid not in _conv_by_cid]:
+        _conv_by_key.pop(k, None)
 
 
 def conv_register(result: Any, texts_after: list[str], model: str) -> str:
@@ -135,36 +145,40 @@ def conv_register(result: Any, texts_after: list[str], model: str) -> str:
     ``texts_after`` is the flattened history INCLUDING our reply — its
     prefix minus the trailing assistant entry is this turn's parent key and
     the whole list is the child key the NEXT request will fingerprint.
+    Re-registering the same turn (e.g. a client retrying the identical
+    request) simply overwrites the same keys — lookups stay stable.
     """
     cid = result.conversation_id or ""
     now = time.time()
-    if cid:
-        _conv_by_cid[cid] = _ConvRecord(
-            metadata=result.metadata or [], model=model, created_at=now, updated_at=now
-        )
-    if len(texts_after) >= 1:
-        _conv_by_key[session_key(texts_after[:-1], model)] = cid
-    _conv_by_key[session_key(texts_after, model)] = cid
-    _conv_evict()
+    with _CONV_LOCK:
+        if cid:
+            _conv_by_cid[cid] = _ConvRecord(
+                metadata=result.metadata or [], model=model, created_at=now, updated_at=now
+            )
+        if len(texts_after) >= 1:
+            _conv_by_key[session_key(texts_after[:-1], model)] = cid
+        _conv_by_key[session_key(texts_after, model)] = cid
+        _conv_evict()
     return cid
 
 
 def conv_lookup(texts: list[str], model: str, conv_id: Optional[str] = None) -> Optional["_ConvRecord"]:
     """Find a live record by explicit id, else by the parent fingerprint."""
-    if conv_id:
-        rec = _conv_by_cid.get(conv_id)
+    with _CONV_LOCK:
+        if conv_id:
+            rec = _conv_by_cid.get(conv_id)
+            if rec and time.time() - rec.updated_at <= _CONV_TTL:
+                return rec
+            return None
+        if not texts:
+            return None
+        cid = _conv_by_key.get(session_key(texts, model))
+        if not cid:
+            return None
+        rec = _conv_by_cid.get(cid)
         if rec and time.time() - rec.updated_at <= _CONV_TTL:
             return rec
         return None
-    if not texts:
-        return None
-    cid = _conv_by_key.get(session_key(texts, model))
-    if not cid:
-        return None
-    rec = _conv_by_cid.get(cid)
-    if rec and time.time() - rec.updated_at <= _CONV_TTL:
-        return rec
-    return None
 
 # Single-cookie single-writer: the web session must not be driven
 # concurrently (review-20261102 P1-1). stdio was naturally serial; both the

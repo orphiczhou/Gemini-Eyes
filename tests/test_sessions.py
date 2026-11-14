@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -183,3 +184,185 @@ def test_model_key_switch_breaks_chain(chat_stub):
     # different model scope -> miss -> full transcript, new conversation
     assert chat_stub.captured[1]["meta"] is None
     assert "[user]\nu1" in chat_stub.captured[1]["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# 1.6 Fingerprint chain: hit sends the last user turn only, miss replays all
+# ---------------------------------------------------------------------------
+
+
+def test_chain_hit_sends_last_user_turn_and_reuses_metadata(chat_stub):
+    r1 = _chat({"messages": [{"role": "user", "content": "u1"}]})
+    assert r1.status_code == 200
+    # fresh conversation: single-turn prompt, no metadata
+    assert chat_stub.captured[0]["prompt"] == "u1"
+    assert chat_stub.captured[0]["meta"] is None
+
+    r2 = _chat(
+        {
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "u2"},
+            ]
+        }
+    )
+    assert r2.status_code == 200
+    # hit: only the last user turn is sent, the web-side conversation continues
+    assert chat_stub.captured[1]["prompt"] == "u2"
+    assert chat_stub.captured[1]["meta"] is not None
+    assert chat_stub.captured[1]["meta"][0] == "c_1"
+    assert chat_stub.captured[1]["meta"][1] == "r_1"
+
+
+def test_chain_miss_sends_full_transcript_as_new_conversation(chat_stub):
+    _chat({"messages": [{"role": "user", "content": "u1"}]})
+    # the replayed assistant turn was rewritten -> parent fingerprint differs
+    r2 = _chat(
+        {
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "REWRITTEN"},
+                {"role": "user", "content": "u2"},
+            ]
+        }
+    )
+    assert r2.status_code == 200
+    assert chat_stub.captured[1]["meta"] is None
+    prompt = chat_stub.captured[1]["prompt"]
+    assert "[user]\nu1" in prompt
+    assert "[assistant]\nREWRITTEN" in prompt
+    assert prompt.endswith("[assistant]")
+
+
+def test_system_add_remove_keeps_chain_intact(chat_stub):
+    """system messages never enter the fingerprint — editing them mid-chat
+    must neither break nor create a chain."""
+    _chat({"messages": [{"role": "system", "content": "be brief"},
+                        {"role": "user", "content": "u1"}]})
+    r2 = _chat({"messages": [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "u2"},
+    ]})
+    assert r2.status_code == 200
+    # still chained: only the new user turn (plus the system prefix, which is
+    # always re-sent) — no transcript replay
+    assert chat_stub.captured[1]["prompt"].endswith("u2")
+    assert "[user]" not in chat_stub.captured[1]["prompt"]
+
+    # system message dropped entirely in round 3 -> still chained
+    r3 = _chat({"messages": [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "u3"},
+    ]})
+    assert r3.status_code == 200
+    assert chat_stub.captured[2]["prompt"] == "u3"
+
+
+# ---------------------------------------------------------------------------
+# 1.6 Session table internals: parent/child keys, eviction, orphan cleanup
+# ---------------------------------------------------------------------------
+
+
+class _RegResult:
+    def __init__(self, cid, rid="r_x"):
+        self.conversation_id = cid
+        self.metadata = [cid, rid, "", None, None, None, None, None, None, ""]
+
+
+def _register(cid="c_a", texts=("user: u1", "assistant: ok"), model="argon"):
+    server.conv_register(_RegResult(cid), list(texts), model)
+
+
+def test_conv_register_parent_and_child_keys():
+    _register()
+    parent = server.session_key(["user: u1"], "argon")
+    child = server.session_key(["user: u1", "assistant: ok"], "argon")
+    assert server._conv_by_key[parent] == "c_a"
+    assert server._conv_by_key[child] == "c_a"
+    # lookup paths: parent fingerprint (next request) and explicit id
+    assert server.conv_lookup(["user: u1"], "argon") is not None
+    assert server.conv_lookup([], "argon", conv_id="c_a") is not None
+
+
+def test_session_key_stable_and_model_scoped():
+    a = server.session_key(["user: u1", "assistant: ok"], "argon")
+    b = server.session_key(["user: u1", "assistant: ok"], "argon")
+    assert a == b  # deterministic
+    assert a != server.session_key(["user: u1", "assistant: ok"], "pro")  # model-scoped
+    assert a != server.session_key(["user: u1", "assistant: ok!"], "argon")  # text-scoped
+    assert a != server.session_key(["assistant: ok", "user: u1"], "argon")  # order-scoped
+
+
+def test_conv_register_idempotent_for_retries():
+    """A client retrying the identical request re-registers the same keys."""
+    _register()
+    _register()
+    assert len(server._conv_by_key) == 2  # parent + child, not duplicated
+    assert server.conv_lookup(["user: u1"], "argon") is not None
+
+
+def test_conv_evict_ttl():
+    _register()
+    server._conv_by_cid["c_a"].updated_at = time.time() - server._CONV_TTL - 1
+    assert server.conv_lookup(["user: u1"], "argon") is None  # expired
+    server._conv_evict()
+    assert "c_a" not in server._conv_by_cid
+    assert not server._conv_by_key  # keys died with the record
+
+
+def test_conv_evict_capacity_trims_oldest(monkeypatch):
+    monkeypatch.setattr(server, "_CONV_MAX", 2)
+    now = time.time()
+    for i, cid in enumerate(("c_old", "c_mid", "c_new")):
+        _register(cid=cid, texts=(f"user: q{i}",))
+        server._conv_by_cid[cid].updated_at = now - (100 - i)  # distinct ages
+    server._conv_evict()
+    assert set(server._conv_by_cid) == {"c_mid", "c_new"}  # oldest trimmed
+    # surviving keys still resolve, trimmed ones are gone
+    assert server.conv_lookup(["user: q2"], "argon") is not None
+    assert server.conv_lookup(["user: q0"], "argon") is None
+
+
+def test_conv_evict_cleans_orphan_keys_unconditionally():
+    """Regression: orphan keys used to survive when nothing was stale/over
+    capacity — they poisoned later lookups with dead conversation ids."""
+    _register()  # healthy record, table under capacity, nothing stale
+    server._conv_by_key["deadbeef"] = "c_gone"  # orphan: no cid record
+    server._conv_evict()
+    assert "deadbeef" not in server._conv_by_key
+    # the healthy entries are untouched
+    assert server.conv_lookup(["user: u1"], "argon") is not None
+
+
+def test_session_table_thread_smoke(monkeypatch):
+    """Hammer register/lookup from several threads; the lock must keep the
+    table consistent (no lost records, no exceptions)."""
+    import threading
+
+    monkeypatch.setattr(server, "_CONV_MAX", 1000)  # keep eviction out of the way
+    errors: list[Exception] = []
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(50):
+                _register(cid=f"c_{n}_{i}", texts=(f"user: q{n}_{i}",))
+                server.conv_lookup([f"user: q{n}_{i}"], "argon")
+                server.conv_lookup([f"user: q{n}_{i}"], "argon", conv_id=f"c_{n}_{i}")
+        except Exception as exc:  # noqa: BLE001 - record and fail
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert len(server._conv_by_cid) == 8 * 50  # nothing lost, nothing duplicated
+    # one unique child key per turn + the shared empty-parent key (overwritten)
+    assert len(server._conv_by_key) == 8 * 50 + 1
