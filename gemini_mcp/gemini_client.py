@@ -294,6 +294,16 @@ GRPC_LIST_CHATS = "MaZiqc"
 GRPC_READ_CHAT = "hNvQHb"
 GRPC_DELETE_CHAT_1 = "GzXR5e"
 GRPC_DELETE_CHAT_2 = "qWymEb"
+# Account/system RPCs (model discovery, plan quota and usage windows).
+GRPC_GET_USER_STATUS = "otAQ7b"
+GRPC_CHECK_GEMINI_QUOTA = "qpEbW"
+GRPC_GET_USAGE_INFO = "jSf9Qc"
+# Quota probes mirror the web app's own usage-limits window: Flash-family
+# models and Pro-family/Extended-Thinking models each report a separate
+# request-quota bucket. GET_USAGE_INFO (jSf9Qc) is the newer compute-based
+# accounting and needs no payload.
+QUOTA_FLASH_PAYLOAD = "[[[1,11],[2,11],[6,11]]]"
+QUOTA_ADVANCED_PAYLOAD = "[[[1,4],[6,6],[1,15]]]"
 
 # Known server error codes (from the web app's frontend).
 ERROR_CODES = {
@@ -510,6 +520,9 @@ class GeminiWebClient:
         # Telemetry for the usage surface (gemini_usage / GET /v1/usage):
         # model-chain degradations are the practical "plan headroom" signal.
         self.fallback_events: list[dict[str, Any]] = []
+        # Runtime model discovery cache (otAQ7b); None until first discovery,
+        # {} means discovery ran but found nothing usable (fall back to catalog).
+        self._model_registry: Optional[dict[str, Any]] = None
 
         self.session = requests.Session()
         for name, value in cookies.items():
@@ -567,6 +580,8 @@ class GeminiWebClient:
         token = re.search(r'"SNlM0e":\s*"(.*?)"', text)
         bl = re.search(r'"cfb2h":\s*"(.*?)"', text)
         sid = re.search(r'"FdrFJe":\s*"(.*?)"', text)
+        ui_lang = re.search(r'"TuX5cc":\s*"(.*?)"', text)
+        push_id = re.search(r'"qKIAYe":\s*"(.*?)"', text)
         if not token:
             raise GeminiWebError(
                 "Could not parse SNlM0e token from the Gemini page. "
@@ -574,6 +589,10 @@ class GeminiWebClient:
             )
         self.access_token = token.group(1)
         self.build_label = bl.group(1) if bl else None
+        # Aux page values (stored for diagnostics; the web app sends the UI
+        # language as hl and the push subscription id on upload flows).
+        self.ui_language = ui_lang.group(1) if ui_lang else None
+        self.push_id = push_id.group(1) if push_id else None
         self.session_id = sid.group(1) if sid else None
         self._token_fetched_at = time.time()
 
@@ -581,16 +600,25 @@ class GeminiWebClient:
     # __Secure-1PSIDTS auto-rotation
     # ------------------------------------------------------------------
 
-    def rotate_cookies(self, force: bool = False) -> bool:
+    def rotate_cookies(self, force: bool = False, skip_if_fresh: bool = False) -> bool:
         """Refresh __Secure-1PSIDTS via accounts.google.com/RotateCookies.
 
         Google issues 1PSIDTS as a short-lived token; the RotateCookies
         endpoint exchanges the current session for a fresh set of cookies
         (including a new 1PSIDTS) via Set-Cookie. Returns True when the
         jar now holds a (possibly new) 1PSIDTS. A 60s cooldown avoids 429s.
+
+        ``skip_if_fresh`` additionally bails out when the cookie file was
+        written within the last 60s (another writer rotated for us) — the
+        background rotation thread uses this so concurrent clients never
+        hammer the endpoint into a 429.
         """
         if not force and time.time() - self._last_rotate_at < 60:
             return self.get_cookie("__Secure-1PSIDTS") is not None
+        if skip_if_fresh:
+            path = os.environ.get("GEMINI_COOKIE_FILE")
+            if path and os.path.isfile(path) and time.time() - os.path.getmtime(path) <= 60:
+                return self.get_cookie("__Secure-1PSIDTS") is not None
         if not self.get_cookie("__Secure-1PSID"):
             return False
         headers = {
@@ -610,6 +638,8 @@ class GeminiWebClient:
             )
             self._last_rotate_at = time.time()
             if resp.status_code == 401 or resp.status_code >= 400:
+                # A 401 means the short-lived token was rejected; whatever is
+                # on disk stays untouched (never persist a rejected jar).
                 return False
             # The server answered with Set-Cookie headers; requests already
             # merged them into the session jar. Verify we still hold a token.
@@ -626,8 +656,11 @@ class GeminiWebClient:
 
     def ensure_fresh(self, force: bool = False) -> None:
         """Rotate the session cookie BEFORE requesting tokens, so the
-        short-lived 1PSIDTS is periodically renewed even while idle."""
-        if force or time.time() - self._last_rotate_at >= 1500:  # every ~25 min
+        short-lived 1PSIDTS is periodically renewed even while idle.
+
+        The ~25 min threshold carries a ±60s jitter so a fleet of clients
+        does not synchronise their rotation bursts onto the endpoint."""
+        if force or time.time() - self._last_rotate_at >= 1500 + random.uniform(-60, 60):
             self.rotate_cookies()
 
     def _params(self) -> dict[str, Any]:
@@ -1306,6 +1339,152 @@ class GeminiWebClient:
         """Delete a conversation (two RPC calls, same as the web UI)."""
         self.batch_execute([(GRPC_DELETE_CHAT_1, json.dumps([conversation_id]))])
         self.batch_execute([(GRPC_DELETE_CHAT_2, json.dumps([conversation_id, [1, None, 0, 1]]))])
+
+    # ------------------------------------------------------------------
+    # Account RPCs: model discovery, plan quota, compute-usage windows
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rpc_body(frames: list[Any], rpc_id: str) -> Optional[list[Any]]:
+        """Extract and parse the first payload body for *rpc_id* from frames."""
+        for frame in frames:
+            if get_nested(frame, [1]) != rpc_id:
+                continue
+            body_str = get_nested(frame, [2])
+            if not isinstance(body_str, str):
+                continue
+            try:
+                body = json.loads(body_str)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(body, list):
+                return body
+        return None
+
+    def discover_models(self, refresh: bool = False) -> dict[str, Any]:
+        """Discover the account's live model list via GetUserStatus (otAQ7b).
+
+        The response carries the model roster in part_body[15] plus the
+        account's tier/capability flags in [16]/[17], from which the header
+        capacity is derived (Plus=4, Pro=3, mid tiers=2, Free=1). Results
+        are cached on the client until ``refresh=True``; failures raise
+        GeminiWebError like any RPC, and callers fall back to the static
+        MODEL_CATALOG.
+        """
+        if self._model_registry is not None and not refresh:
+            return self._model_registry
+        frames = self.batch_execute([(GRPC_GET_USER_STATUS, json.dumps([]))])
+        body = self._rpc_body(frames, GRPC_GET_USER_STATUS)
+        models_list = get_nested(body, [15])
+        if not isinstance(models_list, list):
+            raise GeminiWebError("model discovery: no model list in GetUserStatus response")
+        tier_flags = get_nested(body, [16], [])
+        capability_flags = get_nested(body, [17], [])
+        if 115 in capability_flags:
+            capacity = 4
+        elif 16 in tier_flags or 106 in capability_flags:
+            capacity = 3
+        elif 8 in tier_flags or 19 in capability_flags:
+            capacity = 2
+        else:
+            capacity = 1
+        models = []
+        for item in models_list:
+            if not isinstance(item, list):
+                continue
+            model_id = get_nested(item, [0])
+            if not model_id or not isinstance(model_id, str):
+                continue
+            category = str(get_nested(item, [1]) or get_nested(item, [10]) or "")
+            display = str(get_nested(item, [11]) or get_nested(item, [19]) or "")
+            raw_number = get_nested(item, [17])
+            model_number = raw_number if isinstance(raw_number, int) else 1
+            models.append(
+                {
+                    "model_id": model_id,
+                    "name": (
+                        f"gemini-{category.lower().replace(' ', '-')}"
+                        if category
+                        else f"gemini-{model_id}"
+                    ),
+                    "display_name": display or category,
+                    "model_number": model_number,
+                }
+            )
+        self._model_registry = {"capacity": capacity, "models": models}
+        return self._model_registry
+
+    def fetch_quota(self) -> dict[str, Any]:
+        """Request-quota buckets mirroring the web usage-limits window (qpEbW).
+
+        Two probes, same payloads the web app sends: Flash-family models and
+        Pro-family/Extended-Thinking. Returns ``{quota_id: {...}}`` where
+        total==0 and remaining==0 means unlimited for that bucket.
+        """
+        out: dict[str, Any] = {}
+        for payload_str, category in (
+            (QUOTA_FLASH_PAYLOAD, "flash"),
+            (QUOTA_ADVANCED_PAYLOAD, "pro"),
+        ):
+            frames = self.batch_execute(
+                [(GRPC_CHECK_GEMINI_QUOTA, payload_str)], source_path="/usage"
+            )
+            body = self._rpc_body(frames, GRPC_CHECK_GEMINI_QUOTA)
+            if body is None:
+                continue
+            action_labels = {4: "Gemini Pro", 11: "Gemini Flash", 15: "Gemini Flash Thinking"}
+            for item in get_nested(body, [0], []) or []:
+                quota_id_list = get_nested(item, [0], [])
+                action_id = get_nested(item, [0, 1])
+                if not isinstance(action_id, int):
+                    continue
+                quota_id = "-".join(map(str, quota_id_list)) or str(action_id)
+                out[quota_id] = {
+                    "label": action_labels.get(action_id, f"Gemini {category}"),
+                    "action_id": action_id,
+                    "usage_percentage": get_nested(item, [2]),
+                    "total": get_nested(item, [4]),
+                    "remaining": get_nested(item, [5]),
+                    "reset_time": get_nested(item, [3, 0]),
+                }
+        return out
+
+    def fetch_usage_info(self) -> dict[str, Any]:
+        """Compute-based usage window (jSf9Qc): plan tier, current 5h and
+        weekly usage fractions, and the AI-credit balance from the web UI's
+        usage-limits dialog."""
+        frames = self.batch_execute([(GRPC_GET_USAGE_INFO, "[]")], source_path="/usage")
+        body = self._rpc_body(frames, GRPC_GET_USAGE_INFO)
+        if body is None:
+            raise GeminiWebError("usage info: empty response")
+        tier_labels = {1: "FREE", 2: "PRO", 3: "ULTRA", 4: "PLUS", 6: "ULTRA"}
+        windows = {1: ("current_5h", "5h"), 2: ("weekly", "weekly")}
+        tier_id = get_nested(body, [0])
+        info: dict[str, Any] = {
+            "tier": {"id": tier_id, "label": tier_labels.get(tier_id)},
+            "use_overage_ai_credits": get_nested(body, [2]),
+            "current_5h": None,
+            "weekly": None,
+        }
+        for item in get_nested(body, [1], []) or []:
+            remaining = get_nested(item, [0])
+            usage_level = get_nested(item, [1])
+            metric_type = get_nested(item, [2])
+            reset_ts = get_nested(item, [3, 0, 0])
+            if metric_type == 3:
+                info["ai_credits_remaining"] = remaining
+                continue
+            key, window_label = windows.get(metric_type, (f"type_{metric_type}", "unknown"))
+            info[key] = {
+                "window": window_label,
+                "remaining_credits": remaining,
+                "usage_level": usage_level,
+                "usage_percentage": (
+                    round(usage_level * 100) if isinstance(usage_level, (int, float)) else None
+                ),
+                "reset_at": reset_ts,
+            }
+        return info
 
 
 def _parse_plain_response(text: str) -> list[Any]:

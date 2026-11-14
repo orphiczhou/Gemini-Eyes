@@ -246,12 +246,16 @@ def _persist_cookies(client: GeminiWebClient) -> None:
 
 
 def _auto_rotate_loop() -> None:
-    """Background daemon: renew the short-lived 1PSIDTS cookie periodically."""
+    """Background daemon: renew the short-lived 1PSIDTS cookie periodically.
+
+    ``skip_if_fresh`` bails out when the cookie file was written within the
+    last minute (another client rotated for us), so concurrent gemini-web
+    clients never turn the shared RotateCookies endpoint into a 429 fight."""
     while True:
         time.sleep(_ROTATE_INTERVAL)
         try:
             client = _get_client()
-            if client.rotate_cookies(force=True):
+            if client.rotate_cookies(force=True, skip_if_fresh=True):
                 _persist_cookies(client)
         except Exception:  # noqa: BLE001 - keep the loop alive
             log.warning("Background cookie rotation failed", exc_info=True)
@@ -397,11 +401,14 @@ def gemini_models() -> dict[str, Any]:
 
 
 def _usage_payload() -> dict[str, Any]:
-    """Local usage counters + session health, shared by tool and REST surface.
+    """Local usage counters + server-side plan truth, shared by tool and REST.
 
-    The web backend has no per-account usage API, so this is process-local
-    accounting; fallback events (Argon -> Pro -> Flash on 1037/1052/1050) are
-    the practical "plan headroom is shrinking" signal.
+    Two sources: (1) process-local accounting — request counts, character
+    estimates, model-fallback events; (2) the web backend's own usage-limits
+    data via account RPCs (qpEbW request-quota buckets + jSf9Qc compute-based
+    5h/weekly windows with AI credits). Either server source failing degrades
+    gracefully; ``server_quota.alert_level`` rolls the worst bucket into
+    ok/warning/critical/exhausted for clients.
     """
     from .usage import snapshot
 
@@ -418,6 +425,36 @@ def _usage_payload() -> dict[str, Any]:
             "interval_seconds": _ROTATE_INTERVAL,
             "persist_to": _cookie_file_path() if _cookies_from_file else None,
         }
+        server: dict[str, Any] = {}
+        try:
+            server["quotas"] = client.fetch_quota()
+        except Exception as e:  # noqa: BLE001 - per-source degradation
+            server["quotas_error"] = str(e)
+        try:
+            server["usage_info"] = client.fetch_usage_info()
+        except Exception as e:  # noqa: BLE001 - per-source degradation
+            server["usage_info_error"] = str(e)
+        server["ok"] = "quotas" in server or "usage_info" in server
+        levels: list[float] = []
+        for bucket in server.get("quotas", {}).values():
+            pct = bucket.get("usage_percentage")
+            if isinstance(pct, (int, float)):
+                levels.append(float(pct))
+        usage_info = server.get("usage_info") or {}
+        for key in ("current_5h", "weekly"):
+            window = usage_info.get(key) or {}
+            pct = window.get("usage_percentage") if isinstance(window, dict) else None
+            if isinstance(pct, (int, float)):
+                levels.append(float(pct))
+        worst = max(levels) if levels else None
+        server["worst_usage_percentage"] = worst
+        server["alert_level"] = (
+            "exhausted" if worst is not None and worst >= 100
+            else "critical" if worst is not None and worst >= 90
+            else "warning" if worst is not None and worst >= 75
+            else "ok"
+        )
+        data["server_quota"] = server
     except Exception as e:  # noqa: BLE001 - diagnostics tool must not crash
         data["errors"] = [str(e)]
     return data

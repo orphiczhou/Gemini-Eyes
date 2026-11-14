@@ -261,7 +261,7 @@ async def _healthz(request: Request) -> JSONResponse:
     return JSONResponse(await run_in_threadpool(_healthz_payload))
 
 
-async def _models(request: Request) -> JSONResponse:
+def _models_payload() -> dict[str, Any]:
     data = []
     for name, (model_id, capacity, number) in MODEL_CATALOG.items():
         data.append(
@@ -282,18 +282,29 @@ async def _models(request: Request) -> JSONResponse:
             "gemini": {"note": "model-less legacy payload (web default behaviour)"},
         }
     )
-    return JSONResponse(
-        {
-            "object": "list",
-            "data": data,
-            "gemini": {
-                "default_model": f"gemini-{DEFAULT_MODEL}",
-                "default_thinking": DEFAULT_THINKING,
-                "thinking_levels": dict(THINKING_LEVELS),
-                "model_aliases": dict(MODEL_ALIASES),
-            },
-        }
-    )
+    out: dict[str, Any] = {
+        "object": "list",
+        "data": data,
+        "gemini": {
+            "default_model": f"gemini-{DEFAULT_MODEL}",
+            "default_thinking": DEFAULT_THINKING,
+            "thinking_levels": dict(THINKING_LEVELS),
+            "model_aliases": dict(MODEL_ALIASES),
+        },
+    }
+    # Live account discovery (otAQ7b): the roster the account actually sees,
+    # with the tier-derived header capacity. Best-effort — a failure keeps
+    # the static catalog above untouched.
+    try:
+        client = _get_client()
+        out["gemini"]["discovered"] = client.discover_models()
+    except Exception:  # noqa: BLE001 - discovery is enhancement, not contract
+        out["gemini"]["discovered"] = None
+    return out
+
+
+async def _models(request: Request) -> JSONResponse:
+    return JSONResponse(await run_in_threadpool(_models_payload))
 
 
 async def _status(request: Request) -> JSONResponse:
