@@ -1572,6 +1572,15 @@ class GeminiWebClient:
         self._model_registry = {"capacity": capacity, "models": models}
         return self._model_registry
 
+    def model_registry_snapshot(self) -> Optional[dict[str, Any]]:
+        """Read the discovery cache without network I/O or locking.
+
+        Returns None until the background prewarm has populated it — request
+        handlers must never trigger discovery inline (it needs the generate
+        lock plus the network and would hang the endpoint).
+        """
+        return self._model_registry
+
     def fetch_quota(self) -> dict[str, Any]:
         """Request-quota buckets mirroring the web usage-limits window (qpEbW).
 

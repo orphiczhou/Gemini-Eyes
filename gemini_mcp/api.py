@@ -299,16 +299,13 @@ def _models_payload() -> dict[str, Any]:
             "model_aliases": dict(MODEL_ALIASES),
         },
     }
-    # Live account discovery (otAQ7b): the roster the account actually sees,
-    # with the tier-derived header capacity. Best-effort — a failure keeps
-    # the static catalog above untouched. Discovery drives the same session
-    # as generate(), so it takes the generate lock.
-    from .server import _GENERATE_LOCK
-
+    # Live account discovery (otAQ7b): served from the client-side cache
+    # warmed by the background prewarm thread at startup. NEVER discovered
+    # inline here — the RPC needs the generate lock and the network, and a
+    # cold request would hang on both (observed as a hung /v1/models).
     try:
         client = _get_client()
-        with _GENERATE_LOCK:
-            out["gemini"]["discovered"] = client.discover_models()
+        out["gemini"]["discovered"] = client.model_registry_snapshot()
     except Exception:  # noqa: BLE001 - discovery is enhancement, not contract
         out["gemini"]["discovered"] = None
     return out

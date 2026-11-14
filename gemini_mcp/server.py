@@ -248,6 +248,31 @@ def _persist_cookies(client: GeminiWebClient) -> None:
             log.warning("Failed to persist rotated cookies: %s", e)
 
 
+def _prewarm_account_rpcs() -> None:
+    """Populate the model-discovery cache once, in the background.
+
+    Retries with backoff: cookies may still be settling right after startup.
+    Failures are silent by design — the static catalog keeps serving and the
+    snapshot stays None until a later attempt succeeds."""
+    import time as _time
+
+    _time.sleep(5)  # let the cookie file load and /healthz go ready first
+    for attempt in range(3):
+        try:
+            client = _get_client()
+            with _GENERATE_LOCK:
+                registry = client.discover_models()
+            log.info(
+                "Model discovery prewarmed: %d models, capacity %d",
+                len(registry.get("models", [])),
+                registry.get("capacity", 0),
+            )
+            return
+        except Exception as e:  # noqa: BLE001 - background best-effort
+            log.warning("Model discovery prewarm attempt %d failed: %s", attempt + 1, e)
+            _time.sleep(60 * (attempt + 1))
+
+
 def _auto_rotate_loop() -> None:
     """Background daemon: renew the short-lived 1PSIDTS cookie periodically.
 
@@ -916,6 +941,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     import threading
 
     threading.Thread(target=_auto_rotate_loop, daemon=True, name="gemini-cookie-rotator").start()
+    # Warm the model-discovery cache in the background so /v1/models (and any
+    # consumer of the roster) is served instantly from cache and never hangs
+    # on the network or the generate lock.
+    threading.Thread(target=_prewarm_account_rpcs, daemon=True, name="gemini-prewarm").start()
 
     if args.transport == "http":
         import asyncio
