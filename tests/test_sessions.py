@@ -115,3 +115,28 @@ def test_available_model_still_passes(chat_stub):
     resp = _chat({"model": "gemini-pro", "messages": [{"role": "user", "content": "hi"}]})
     assert resp.status_code == 200
     assert chat_stub.captured[0]["model"] == "pro"
+
+
+# ---------------------------------------------------------------------------
+# 1.3 Deep Think (level 3) refused with an actionable 400
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [3, "3", "deep", "deep_think", "深层"])
+def test_deep_think_refused_with_400(chat_stub, value):
+    resp = _chat(
+        {"gemini_thinking": value, "messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 400
+    body = _body(resp)
+    assert body["error"]["code"] == "deep_think_unavailable"
+    assert "=1/2/2" in body["error"]["message"]
+    assert chat_stub.captured == []  # refused before any upstream work
+
+
+def test_thinking_high_passes_through(chat_stub):
+    resp = _chat(
+        {"gemini_thinking": "高", "messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 200
+    assert chat_stub.captured[0]["thinking"] == "高"

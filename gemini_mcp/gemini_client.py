@@ -213,7 +213,10 @@ UNAVAILABLE_MODELS: dict[str, str] = {
 #   1 = standard, 2 = extended, 3 = deep think.
 # Level 3 ("Deep Think") is asynchronous: the first response is only a
 # "processing, check back later" placeholder, so the highest level that still
-# answers synchronously is 2 — hence the default.
+# answers synchronously is 2 — hence the default. Level 3 is NOT part of the
+# accepted vocabulary anymore: asking for it raises DeepThinkUnavailable so
+# callers fail fast with an actionable message instead of hanging on a
+# placeholder frame. Both zh and EN "high" mean level 2 (extended).
 THINKING_LEVELS: dict[str, int] = {
     "standard": 1,
     "low": 1,
@@ -225,12 +228,32 @@ THINKING_LEVELS: dict[str, int] = {
     "max": 2,
     "highest": 2,
     "中": 2,
-    "deep": 3,
-    "deep_think": 3,
-    "deepthink": 3,
-    "高": 3,
+    "高": 2,
 }
 DEFAULT_THINKING = 2
+
+# Spellings that used to map to level 3 — now rejected outright.
+DEEP_THINK_KEYS = frozenset(
+    {"deep", "deep_think", "deepthink", "深层", "深度", "深度思考"}
+)
+
+
+class DeepThinkUnavailable(ValueError):
+    """Raised when thinking level 3 (Deep Think) is requested.
+
+    The web backend answers level 3 asynchronously: the first reply is only a
+    "processing" placeholder and the real answer arrives later via a follow-up
+    poll. The synchronous facade cannot serve that, so the request is refused
+    with this error instead of silently hanging (REST: 400
+    ``deep_think_unavailable``). Use 低/中/高 = 1/2/2 instead.
+    """
+
+
+# Shared refusal wording (mentions the usable vocabulary).
+_DEEP_THINK_MESSAGE = (
+    "thinking level 3 (Deep Think) is an asynchronous placeholder and is not "
+    "available; use 低/中/高 = 1/2/2"
+)
 
 # Server-side error codes that mean "this model setting is not usable here".
 # 1037 = usage limit for this model/account, 1052 = model header invalid or
@@ -326,13 +349,20 @@ def _normalise_model_name(raw: str) -> str:
 
 
 def resolve_thinking_level(raw: Optional[Union[int, str]], default: int = DEFAULT_THINKING) -> int:
-    """Map a user-provided thinking depth to the native level (1/2/3)."""
+    """Map a user-provided thinking depth to the native level (1 or 2).
+
+    Level 3 (Deep Think) is asynchronous and unavailable on the synchronous
+    facade: an explicit 3 (int or "3") or any Deep-Think spelling raises
+    :class:`DeepThinkUnavailable`. Unrecognised values keep the default.
+    """
     if raw is None:
         return default
     if isinstance(raw, bool):  # bool is an int subclass — treat True as default
         return default
     if isinstance(raw, int):
-        return raw if raw in (1, 2, 3) else default
+        if raw == 3:
+            raise DeepThinkUnavailable(_DEEP_THINK_MESSAGE)
+        return raw if raw in (1, 2) else default
     key = str(raw).strip().lower().replace("-", "_")
     if not key:
         return default
@@ -340,13 +370,17 @@ def resolve_thinking_level(raw: Optional[Union[int, str]], default: int = DEFAUL
         return default
     if key in ("false", "no"):
         return 1
+    if key in DEEP_THINK_KEYS:
+        raise DeepThinkUnavailable(_DEEP_THINK_MESSAGE)
     if key in THINKING_LEVELS:
         return THINKING_LEVELS[key]
     try:
         value = int(key)
     except ValueError:
         return default
-    return value if value in (1, 2, 3) else default
+    if value == 3:
+        raise DeepThinkUnavailable(_DEEP_THINK_MESSAGE)
+    return value if value in (1, 2) else default
 
 
 def resolve_model_setting(

@@ -6,13 +6,15 @@ per-request fallback-chain rebuild. No network, no real client session.
 
 import json
 
+import pytest
+
 from gemini_mcp.api import (
     _ERROR_MAP,
     _gemini_error_response,
     _messages_to_prompt,
     _resolve_thinking,
 )
-from gemini_mcp.gemini_client import GeminiWebClient, GeminiWebError
+from gemini_mcp.gemini_client import DeepThinkUnavailable, GeminiWebClient, GeminiWebError
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +71,14 @@ def test_messages_parts_array_content():
 
 
 def test_thinking_explicit_wins_over_effort():
-    assert _resolve_thinking({"gemini_thinking": 3, "reasoning_effort": "low"}) == 3
-    assert _resolve_thinking({"gemini_thinking": "deep"}) == "deep"
+    assert _resolve_thinking({"gemini_thinking": 1, "reasoning_effort": "high"}) == 1
+    assert _resolve_thinking({"gemini_thinking": "高"}) == "高"
+
+
+@pytest.mark.parametrize("value", [3, "3", "deep", "deep_think", "深层"])
+def test_thinking_level_3_refused_at_validation(value):
+    with pytest.raises(DeepThinkUnavailable):
+        _resolve_thinking({"gemini_thinking": value})
 
 
 def test_thinking_effort_mapping():
@@ -132,6 +140,15 @@ def test_models_payload_carbon_blocked_and_capabilities(monkeypatch):
     # aliases advertise the honest target: UI names for carbon point at carbon
     assert payload["gemini"]["model_aliases"]["4-carbon"] == "carbon"
     assert payload["gemini"]["model_aliases"]["高难任务"] == "carbon"
+    # thinking guide: 低/中/高 = 1/2/2, Deep Think marked unavailable
+    guide = {row["label"]: row for row in payload["gemini"]["thinking_guide"]}
+    assert guide["低"]["value"] == 1
+    assert guide["中"]["value"] == 2
+    assert guide["高"]["value"] == 2
+    assert guide["Deep Think"]["value"] == 3
+    assert guide["Deep Think"]["api"] == "不可用"
+    assert payload["gemini"]["thinking_levels"]["高"] == 2
+    assert "deep" not in payload["gemini"]["thinking_levels"]
 
 
 def test_carbon_alias_resolution():

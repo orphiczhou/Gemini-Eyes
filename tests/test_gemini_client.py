@@ -670,6 +670,7 @@ def test_persist_cookies_writes_file(monkeypatch, tmp_path):
 from gemini_mcp.gemini_client import (  # noqa: E402
     MODEL_CATALOG,
     MODEL_HEADER_KEY,
+    DeepThinkUnavailable,
     resolve_model_setting,
     resolve_thinking_level,
 )
@@ -728,10 +729,19 @@ def test_resolve_thinking_level():
     assert resolve_thinking_level(1) == 1
     assert resolve_thinking_level("standard") == 1
     assert resolve_thinking_level("high") == 2
-    assert resolve_thinking_level("deep") == 3
+    assert resolve_thinking_level("高") == 2  # zh "high" == EN high == extended
+    assert resolve_thinking_level("中") == 2
+    assert resolve_thinking_level("低") == 1
     assert resolve_thinking_level(None) == 2  # highest synchronous depth
     assert resolve_thinking_level(9) == 2  # out-of-range -> default
     assert resolve_thinking_level("nonsense") == 2
+
+
+@pytest.mark.parametrize("raw", [3, "3", "deep", "deep_think", "deepthink", "深层"])
+def test_resolve_thinking_level_3_refused(raw):
+    """Level 3 (Deep Think) is an async placeholder — refused, never mapped."""
+    with pytest.raises(DeepThinkUnavailable):
+        resolve_thinking_level(raw)
 
 
 def test_generate_sends_model_header_and_payload_slots(monkeypatch):

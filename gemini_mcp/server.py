@@ -522,8 +522,9 @@ def gemini_models() -> dict[str, Any]:
         "model_aliases": MODEL_ALIASES,
         "thinking_levels": THINKING_LEVELS,
         "thinking_notes": (
-            "1=standard, 2=extended (default), 3=Deep Think "
-            "(asynchronous: first reply is only a processing placeholder)"
+            "1=standard, 2=extended (default, 低=1/中=2/高=2); 3=Deep Think is an "
+            "async placeholder and is rejected by the REST facade "
+            "(deep_think_unavailable)"
         ),
     }
 
@@ -661,9 +662,10 @@ def gemini_send_message(
         model: Per-call model tier override (e.g. "argon", "pro", "flash",
             "flash-lite", "legacy"). See gemini_models for the full list.
             Unset keeps the process default (GEMINI_MODEL, default argon).
-        thinking: Per-call thinking depth override (1=standard, 2=extended,
-            3=Deep Think async, or aliases like "standard"/"deep"). Unset
-            keeps the process default (GEMINI_THINKING, default 2).
+        thinking: Per-call thinking depth override (1=standard, 2=extended —
+            低=1/中=2/高=2; level 3 Deep Think is an async placeholder and
+            raises DeepThinkUnavailable). Unset keeps the process default
+            (GEMINI_THINKING, default 2).
 
     Returns:
         The model's answer plus conversation_id/response_id/candidate_id to

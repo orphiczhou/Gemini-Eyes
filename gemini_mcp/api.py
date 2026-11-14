@@ -47,12 +47,14 @@ from . import usage
 from .gemini_client import (
     DEFAULT_MODEL,
     DEFAULT_THINKING,
+    DeepThinkUnavailable,
     GeminiWebError,
     MODEL_ALIASES,
     MODEL_CATALOG,
     THINKING_LEVELS,
     UNAVAILABLE_MODELS,
     _normalise_model_name,
+    resolve_thinking_level,
 )
 from .server import (
     _generate_serialized,
@@ -239,11 +241,15 @@ def _resolve_thinking(body: dict[str, Any]) -> Optional[Union[int, str]]:
     """Explicit gemini_thinking wins; OpenAI reasoning_effort maps onto 1/2.
 
     Level 3 (Deep Think) answers asynchronously with a placeholder first
-    frame, so the standardized reasoning_effort field never maps to 3 — it
-    must be requested explicitly via gemini_thinking.
+    frame, so it is refused up front: ``gemini_thinking`` values that resolve
+    to 3 (explicit int/"3" or Deep-Think spellings) raise
+    :class:`DeepThinkUnavailable`, which ``_chat`` translates into 400
+    ``deep_think_unavailable``. The standardized ``reasoning_effort`` field
+    never maps to 3 (minimal/low -> 1, everything else -> 2).
     """
     thinking = body.get("gemini_thinking")
     if thinking is not None:
+        resolve_thinking_level(thinking)  # validation only — raises on level 3
         return thinking
     effort = body.get("reasoning_effort")
     if isinstance(effort, str) and effort.strip():
@@ -324,11 +330,12 @@ def _models_payload() -> dict[str, Any]:
     out["gemini"]["thinking_guide"] = [
         {"label": "低", "value": 1, "api": "同步", "note": "最快，轻任务"},
         {"label": "中", "value": 2, "api": "同步", "note": "默认，质量/延迟平衡"},
+        {"label": "高", "value": 2, "api": "同步", "note": "与中同级（扩展思考），可用"},
         {
-            "label": "高",
+            "label": "Deep Think",
             "value": 3,
-            "api": "异步占位",
-            "note": "Deep Think：首响应仅为处理中占位（completed=false），用返回的 gemini_conversation_id 轮询续聊取终稿",
+            "api": "不可用",
+            "note": "等级 3 为异步占位（首响应仅为处理中提示），本接口直接拒绝：deep_think_unavailable",
         },
     ]
     out["gemini"]["discovered_note"] = (
@@ -397,7 +404,15 @@ async def _chat(request: Request) -> JSONResponse:
 
     conv_id = body.get("gemini_conversation_id")
     resp_id = body.get("gemini_response_id")
-    thinking = _resolve_thinking(body)
+    try:
+        thinking = _resolve_thinking(body)
+    except DeepThinkUnavailable:
+        return _json_error(
+            400,
+            "deep_think_unavailable",
+            "Thinking level 3 = Deep Think is an asynchronous placeholder and is "
+            "not available on this facade; use 低/中/高 (=1/2/2).",
+        )
 
     texts = _messages_to_texts(messages)
     model_key = model_name or f"gemini-{DEFAULT_MODEL}"
