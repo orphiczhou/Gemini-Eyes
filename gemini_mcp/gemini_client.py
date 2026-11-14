@@ -135,11 +135,14 @@ MODEL_HEADER_KEY = "x-goog-ext-525001261-jspb"
 # model_number == MODE_CATEGORY: 1=Flash, 2=Thinking, 3=Pro, 4=Auto,
 # 5=dynamic thinking, 6=Flash-Lite, 8=Argon (Gemini 4).
 MODEL_CATALOG: dict[str, tuple[str, int, int]] = {
-    # Gemini 4 "Argon" — the highest tier the web UI now exposes. Measured
-    # 2026-11-02: number 8 served as "4 Argon High" at thinking 2; the hash
-    # and capacity slots do not change the routing (all catalog hashes and
-    # capacities 1/4 answered "4 Argon"), so the Pro hash is reused.
-    "argon": ("e6fa609c3fa255c0", 4, 8),
+    # Gemini 4 "Argon" — the highest tier the web UI now exposes. Corrected
+    # 2026-11-14 from the account's own model discovery (otAQ7b roster): the
+    # UI entry "高难任务" carries model_id 95a4c0abcba24364 with number 8 and
+    # the account's real capacity 2. The previous entry reused the Pro hash
+    # (e6fa609c…) with capacity 4 — that combination matches no UI entry and
+    # correlated with upstream stalls (requests silently queued, never
+    # answered); e6fa609c + number 3 remains "pro" below.
+    "argon": ("95a4c0abcba24364", 2, 8),
     # Gemini 3.1 Pro — second tier, kept as the first fallback.
     "pro": ("e6fa609c3fa255c0", 4, 3),
     "pro-advanced": ("e6fa609c3fa255c0", 2, 3),
@@ -166,6 +169,12 @@ MODEL_ALIASES: dict[str, str] = {
     "3.6-flash": "flash",
     "3.5-flash": "flash",
     "lite": "flash-lite",
+    # UI display names (gemini web interface, zh-CN) as aliases — observed
+    # via model discovery 2026-11-14.
+    "快速解答": "flash-lite-basic",
+    "日常帮助": "flash",
+    "深度研究": "pro",
+    "高难任务": "argon",
     "legacy": "legacy",
     "default": "legacy",
     "off": "legacy",
