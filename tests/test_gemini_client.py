@@ -4,6 +4,7 @@ request construction and conversation RPCs (no network needed)."""
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -660,7 +661,10 @@ def test_persist_cookies_writes_file(monkeypatch, tmp_path):
     raw = json.loads(cookie_file.read_text(encoding="utf-8"))
     names = {c["name"] for c in raw}
     assert names == {"__Secure-1PSID", "NID"}  # google cookies only
-    assert (cookie_file.stat().st_mode & 0o777) == 0o600
+    # 0600 only holds on POSIX: NTFS ignores chmod except the read-only bit
+    # (st_mode stays 0o666), so the permission assert is platform-gated.
+    if sys.platform != "win32":
+        assert (cookie_file.stat().st_mode & 0o777) == 0o600
 
 
 # ---------------------------------------------------------------------------
