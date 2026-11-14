@@ -600,7 +600,12 @@ class GeminiWebClient:
     # __Secure-1PSIDTS auto-rotation
     # ------------------------------------------------------------------
 
-    def rotate_cookies(self, force: bool = False, skip_if_fresh: bool = False) -> bool:
+    def rotate_cookies(
+        self,
+        force: bool = False,
+        skip_if_fresh: bool = False,
+        cookie_file: Optional[str] = None,
+    ) -> bool:
         """Refresh __Secure-1PSIDTS via accounts.google.com/RotateCookies.
 
         Google issues 1PSIDTS as a short-lived token; the RotateCookies
@@ -608,15 +613,16 @@ class GeminiWebClient:
         (including a new 1PSIDTS) via Set-Cookie. Returns True when the
         jar now holds a (possibly new) 1PSIDTS. A 60s cooldown avoids 429s.
 
-        ``skip_if_fresh`` additionally bails out when the cookie file was
-        written within the last 60s (another writer rotated for us) — the
-        background rotation thread uses this so concurrent clients never
-        hammer the endpoint into a 429.
+        ``skip_if_fresh`` additionally bails out when the cookie file named
+        by ``cookie_file`` (falling back to GEMINI_COOKIE_FILE) was written
+        within the last 60s (another writer rotated for us) — the background
+        rotation thread passes the same resolved path the persist step uses,
+        so read and write stay on one file even when no env is set.
         """
         if not force and time.time() - self._last_rotate_at < 60:
             return self.get_cookie("__Secure-1PSIDTS") is not None
         if skip_if_fresh:
-            path = os.environ.get("GEMINI_COOKIE_FILE")
+            path = cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
             if path and os.path.isfile(path) and time.time() - os.path.getmtime(path) <= 60:
                 return self.get_cookie("__Secure-1PSIDTS") is not None
         if not self.get_cookie("__Secure-1PSID"):
@@ -1379,7 +1385,11 @@ class GeminiWebClient:
         if not isinstance(models_list, list):
             raise GeminiWebError("model discovery: no model list in GetUserStatus response")
         tier_flags = get_nested(body, [16], [])
+        if not isinstance(tier_flags, list):
+            tier_flags = []
         capability_flags = get_nested(body, [17], [])
+        if not isinstance(capability_flags, list):
+            capability_flags = []
         if 115 in capability_flags:
             capacity = 4
         elif 16 in tier_flags or 106 in capability_flags:
@@ -1398,6 +1408,8 @@ class GeminiWebClient:
             category = str(get_nested(item, [1]) or get_nested(item, [10]) or "")
             display = str(get_nested(item, [11]) or get_nested(item, [19]) or "")
             raw_number = get_nested(item, [17])
+            if not isinstance(raw_number, int):
+                raw_number = get_nested(item, [9])
             model_number = raw_number if isinstance(raw_number, int) else 1
             models.append(
                 {

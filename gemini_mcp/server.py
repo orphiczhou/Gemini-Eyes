@@ -35,6 +35,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import threading
 import time
 from pathlib import Path
@@ -248,15 +249,22 @@ def _persist_cookies(client: GeminiWebClient) -> None:
 def _auto_rotate_loop() -> None:
     """Background daemon: renew the short-lived 1PSIDTS cookie periodically.
 
-    ``skip_if_fresh`` bails out when the cookie file was written within the
-    last minute (another client rotated for us), so concurrent gemini-web
-    clients never turn the shared RotateCookies endpoint into a 429 fight."""
+    ``skip_if_fresh`` + the resolved persist path keep read/write on one file,
+    so concurrent gemini-web clients never turn the shared RotateCookies
+    endpoint into a 429 fight. Rotation and persist run under the generate
+    lock: requests.Session is not thread-safe and the jar merge must not
+    race a streaming response. Sleep carries a small jitter so a fleet of
+    clients does not sync its rotation bursts."""
     while True:
-        time.sleep(_ROTATE_INTERVAL)
+        time.sleep(_ROTATE_INTERVAL + random.uniform(-15, 15))
         try:
             client = _get_client()
-            if client.rotate_cookies(force=True, skip_if_fresh=True):
-                _persist_cookies(client)
+            with _GENERATE_LOCK:
+                rotated = client.rotate_cookies(
+                    force=True, skip_if_fresh=True, cookie_file=_cookie_file_path()
+                )
+                if rotated:
+                    _persist_cookies(client)
         except Exception:  # noqa: BLE001 - keep the loop alive
             log.warning("Background cookie rotation failed", exc_info=True)
 
@@ -427,14 +435,18 @@ def _usage_payload() -> dict[str, Any]:
         }
         server: dict[str, Any] = {}
         try:
-            server["quotas"] = client.fetch_quota()
+            # Account RPCs drive the same requests.Session as generate(); take
+            # the generate lock so jar/reqid state stays single-writer.
+            with _GENERATE_LOCK:
+                server["quotas"] = client.fetch_quota()
         except Exception as e:  # noqa: BLE001 - per-source degradation
             server["quotas_error"] = str(e)
         try:
-            server["usage_info"] = client.fetch_usage_info()
+            with _GENERATE_LOCK:
+                server["usage_info"] = client.fetch_usage_info()
         except Exception as e:  # noqa: BLE001 - per-source degradation
             server["usage_info_error"] = str(e)
-        server["ok"] = "quotas" in server or "usage_info" in server
+        server["ok"] = bool(server.get("quotas") or server.get("usage_info"))
         levels: list[float] = []
         for bucket in server.get("quotas", {}).values():
             pct = bucket.get("usage_percentage")
@@ -448,12 +460,15 @@ def _usage_payload() -> dict[str, Any]:
                 levels.append(float(pct))
         worst = max(levels) if levels else None
         server["worst_usage_percentage"] = worst
-        server["alert_level"] = (
-            "exhausted" if worst is not None and worst >= 100
-            else "critical" if worst is not None and worst >= 90
-            else "warning" if worst is not None and worst >= 75
-            else "ok"
-        )
+        if not server["ok"] and worst is None:
+            server["alert_level"] = "unknown"  # both sources failed — no truth
+        else:
+            server["alert_level"] = (
+                "exhausted" if worst is not None and worst >= 100
+                else "critical" if worst is not None and worst >= 90
+                else "warning" if worst is not None and worst >= 75
+                else "ok"
+            )
         data["server_quota"] = server
     except Exception as e:  # noqa: BLE001 - diagnostics tool must not crash
         data["errors"] = [str(e)]
@@ -552,6 +567,9 @@ def gemini_send_message(
 
         usage.record_error()
         raise
+    from . import usage
+
+    usage.record_request(chars_in=len(message), chars_out=len(result.text))
     return result.to_dict()
 
 
@@ -629,7 +647,7 @@ def gemini_review(
     client = _get_client()
     meta = _metadata_for(conversation_id, response_id)
     started = time.time()
-    result = client.generate(question.strip(), metadata=meta, files=selected)
+    result = _generate_serialized(question.strip(), metadata=meta, files=selected)
     payload = result.to_dict()
     payload["files"] = [{"path": p, "bytes": os.path.getsize(p)} for p in selected]
     payload["skipped"] = skipped
@@ -668,7 +686,7 @@ def gemini_analyze_media(
         raise ValueError("file_path must not be empty")
     client = _get_client()
     meta = _metadata_for(conversation_id, response_id)
-    result = client.generate(prompt, metadata=meta, files=[file_path])
+    result = _generate_serialized(prompt, metadata=meta, files=[file_path])
     _remember(result)
     return result.to_dict()
 
@@ -698,7 +716,7 @@ def gemini_generate_image(
     client = _get_client()
     files = [reference_image] if reference_image else None
     meta = _metadata_for(conversation_id, None)
-    result = client.generate(prompt.strip(), metadata=meta, files=files)
+    result = _generate_serialized(prompt.strip(), metadata=meta, files=files)
     _remember(result)
     return _with_saved_media(result, save_dir, kinds={"generated_image"})
 
@@ -728,7 +746,7 @@ def gemini_generate_video(
         raise ValueError("prompt must not be empty")
     client = _get_client()
     meta = _metadata_for(conversation_id, None)
-    result = client.generate(prompt.strip(), metadata=meta)
+    result = _generate_serialized(prompt.strip(), metadata=meta)
     _remember(result)
     videos = [m for m in result.media if m.kind == "generated_video"]
 

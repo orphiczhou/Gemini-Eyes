@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 import time
 import uuid
 from typing import Any, Optional, Union
@@ -60,7 +61,12 @@ from .server import (
 )
 
 _CREATED = int(time.time())
-_VERSION = "0.1.0-api"
+_VERSION = "0.2.0-api"
+
+# The web app decorates replies with UI-only follow-up suggestions that
+# OpenAI-compatible clients would read as reply body — strip them (safe: the
+# tag is self-contained and never spans lines).
+_FOLLOWUP_RE = re.compile(r"\n*<FollowUp [^>]*/>\s*", re.IGNORECASE)
 
 # GeminiWebError code -> (HTTP status, error.code string, human message).
 # Deliberately terse: no upstream response fragments are ever echoed (P1-5).
@@ -294,10 +300,14 @@ def _models_payload() -> dict[str, Any]:
     }
     # Live account discovery (otAQ7b): the roster the account actually sees,
     # with the tier-derived header capacity. Best-effort — a failure keeps
-    # the static catalog above untouched.
+    # the static catalog above untouched. Discovery drives the same session
+    # as generate(), so it takes the generate lock.
+    from .server import _GENERATE_LOCK
+
     try:
         client = _get_client()
-        out["gemini"]["discovered"] = client.discover_models()
+        with _GENERATE_LOCK:
+            out["gemini"]["discovered"] = client.discover_models()
     except Exception:  # noqa: BLE001 - discovery is enhancement, not contract
         out["gemini"]["discovered"] = None
     return out
@@ -377,6 +387,7 @@ async def _chat(request: Request) -> JSONResponse:
 
 def _chat_shell(requested_model: str, prompt: str, result: Any) -> dict[str, Any]:
     """OpenAI chat.completion shell + a `gemini` extension object."""
+    clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
@@ -386,7 +397,7 @@ def _chat_shell(requested_model: str, prompt: str, result: Any) -> dict[str, Any
             {
                 "index": 0,
                 "finish_reason": "stop",
-                "message": {"role": "assistant", "content": result.text},
+                "message": {"role": "assistant", "content": clean_text},
             }
         ],
         "usage": {
