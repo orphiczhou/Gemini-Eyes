@@ -52,6 +52,7 @@ from .gemini_client import (
     GeminiWebError,
     MODEL_ALIASES,
     MODEL_CATALOG,
+    MODEL_THINKING_VARIANTS,
     THINKING_LEVELS,
     UNAVAILABLE_MODELS,
     _normalise_model_name,
@@ -372,6 +373,21 @@ def _models_payload() -> dict[str, Any]:
             entry["available"] = False
             entry["unavailable_reason"] = UNAVAILABLE_MODELS[name]
         data.append(entry)
+    # Baked high-thinking variants (approved scope: exactly these two) —
+    # same shape as catalog entries plus the preset level. No other suffix
+    # variants exist or may appear here.
+    for variant_name, (base, level) in MODEL_THINKING_VARIANTS.items():
+        _model_id, base_capacity, base_number = MODEL_CATALOG[base]
+        data.append(
+            {
+                "id": f"gemini-{variant_name}",
+                "object": "model",
+                "created": _CREATED,
+                "owned_by": "gemini-web",
+                "gemini": {"capacity": base_capacity, "mode_number": base_number},
+                "thinking_preset": level,
+            }
+        )
     data.append(
         {
             "id": "gemini-legacy",
@@ -404,6 +420,13 @@ def _models_payload() -> dict[str, Any]:
             "value": 3,
             "api": "不可用",
             "note": "等级 3 为异步占位（首响应仅为处理中提示），本接口直接拒绝：deep_think_unavailable",
+        },
+        {
+            "label": "-high 后缀",
+            "value": 2,
+            "api": "固定",
+            "note": "带 -high 后缀的模型名（gemini-pro-high / gemini-argon-high）已固定档位 2，"
+            "显式 gemini_thinking / reasoning_effort 字段可覆盖",
         },
     ]
     out["gemini"]["discovered_note"] = (
@@ -459,9 +482,17 @@ async def _chat(request: Request) -> JSONResponse:
     # Model: normalise (gemini- prefix / aliases) and validate explicitly —
     # silently swapping an unknown name for the top tier would mislead clients.
     model_name: Optional[str] = None
+    baked_thinking: Optional[int] = None
     requested_model = body.get("model")
     if requested_model:
         key = _normalise_model_name(str(requested_model))
+        # Baked-thinking variants ("pro-high"/"argon-high") resolve to their
+        # base model first — validity, the plan gate and the session
+        # fingerprint all operate on the base name (the variant is an
+        # equivalent upstream request, so it shares the base chain domain).
+        variant = MODEL_THINKING_VARIANTS.get(key)
+        if variant is not None:
+            key, baked_thinking = variant
         valid = set(MODEL_CATALOG) | {"legacy"} | set(MODEL_ALIASES.values())
         if key not in valid:
             return _json_error(
@@ -491,6 +522,11 @@ async def _chat(request: Request) -> JSONResponse:
             "Thinking level 3 = Deep Think is an asynchronous placeholder and is "
             "not available on this facade; use 低/中/高 (=1/2/2).",
         )
+    # Priority: explicit request fields (gemini_thinking / reasoning_effort)
+    # > a variant's baked level > the client default. _resolve_thinking
+    # returns None exactly when nothing explicit was sent.
+    if thinking is None:
+        thinking = baked_thinking
 
     texts = _messages_to_texts(messages)
     # Fingerprint scope: the normalized catalog name (no gemini- prefix), so

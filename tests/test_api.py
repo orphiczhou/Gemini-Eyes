@@ -263,6 +263,136 @@ def test_carbon_alias_resolution():
 
 
 # ---------------------------------------------------------------------------
+# Baked high-thinking model variants (pro-high, argon-high)
+# ---------------------------------------------------------------------------
+
+from test_sessions import (  # noqa: E402
+    _FakeRequest,
+    _StubResult,
+    _chat,
+    _clean_session_state,
+)
+
+
+@pytest.fixture(autouse=True)
+def _variant_session_table(_clean_session_state):
+    """Isolate the fingerprint table for the e2e variant tests below."""
+    yield
+
+
+@pytest.fixture()
+def variant_chat(monkeypatch):
+    """Capture stub for api._generate_serialized (same shape as chat_stub)."""
+    from types import SimpleNamespace
+
+    captured: list[dict] = []
+
+    def fake_generate(prompt, metadata=None, files=None, model=None, thinking=None):
+        captured.append(
+            {"prompt": prompt, "meta": metadata, "model": model, "thinking": thinking}
+        )
+        return _StubResult(text="ok")
+
+    monkeypatch.setattr("gemini_mcp.api._generate_serialized", fake_generate)
+    return SimpleNamespace(captured=captured)
+
+
+def test_variant_pro_high_bakes_pro_and_thinking_2(variant_chat):
+    resp = _chat({"model": "gemini-pro-high", "messages": [{"role": "user", "content": "hi"}]})
+    assert resp.status_code == 200
+    assert variant_chat.captured[0]["model"] == "pro"
+    assert variant_chat.captured[0]["thinking"] == 2
+
+
+def test_variant_explicit_gemini_thinking_overrides_baked(variant_chat):
+    resp = _chat(
+        {
+            "model": "gemini-pro-high",
+            "gemini_thinking": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    assert resp.status_code == 200
+    assert variant_chat.captured[0]["model"] == "pro"
+    assert variant_chat.captured[0]["thinking"] == 1
+
+
+def test_variant_reasoning_effort_overrides_baked(variant_chat):
+    resp = _chat(
+        {
+            "model": "gemini-pro-high",
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    assert resp.status_code == 200
+    assert variant_chat.captured[0]["thinking"] == 1
+
+
+def test_variant_argon_high_passes_gate(variant_chat):
+    resp = _chat({"model": "argon-high", "messages": [{"role": "user", "content": "hi"}]})
+    assert resp.status_code == 200
+    assert variant_chat.captured[0]["model"] == "argon"
+    assert variant_chat.captured[0]["thinking"] == 2
+
+
+def test_models_payload_contains_exactly_the_two_variants(monkeypatch):
+    from types import SimpleNamespace
+
+    from gemini_mcp import api
+
+    monkeypatch.setattr(
+        api, "_get_client", lambda: SimpleNamespace(model_registry_snapshot=lambda: None)
+    )
+    payload = api._models_payload()
+    ids = {m["id"] for m in payload["data"]}
+    assert "gemini-pro-high" in ids and "gemini-argon-high" in ids
+    # no other suffix variants may exist
+    assert not any(
+        i.endswith(("-low", "-medium", "-max")) or i in {"gemini-flash-high", "gemini-carbon-high"}
+        for i in ids
+    )
+    for m in payload["data"]:
+        if m["id"] in ("gemini-pro-high", "gemini-argon-high"):
+            assert m["thinking_preset"] == 2
+            assert m["gemini"]["mode_number"] == (8 if "argon" in m["id"] else 3)
+    # the guide mentions the -high suffix preset and its override rule
+    guide_notes = " ".join(str(row.get("note", "")) for row in payload["gemini"]["thinking_guide"])
+    assert "-high" in guide_notes and "固定档位 2" in guide_notes
+
+
+def test_variant_shares_fingerprint_domain_with_base_model(variant_chat):
+    """gemini-pro and gemini-pro-high chain onto ONE web conversation — the
+    variant resolves to the base model before the fingerprint is scoped."""
+    r1 = _chat({"model": "gemini-pro", "messages": [{"role": "user", "content": "u1"}]})
+    assert r1.status_code == 200
+    r2 = _chat(
+        {
+            "model": "gemini-pro-high",
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "u2"},
+            ],
+        }
+    )
+    assert r2.status_code == 200
+    # chain hit: only the last user turn + reused metadata (same model_key)
+    assert variant_chat.captured[1]["prompt"] == "u2"
+    assert variant_chat.captured[1]["meta"] is not None
+    assert variant_chat.captured[1]["meta"][0] == "c_1"
+
+
+def test_unknown_suffix_variant_is_unknown_model(variant_chat):
+    for name in ("pro-low", "flash-high", "gemini-pro-medium"):
+        resp = _chat({"model": name, "messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status_code == 400, name
+        body = json.loads(resp.body.decode("utf-8"))
+        assert body["error"]["code"] == "unknown_model", name
+    assert variant_chat.captured == []
+
+
+# ---------------------------------------------------------------------------
 # per-request model chain rebuild
 # ---------------------------------------------------------------------------
 

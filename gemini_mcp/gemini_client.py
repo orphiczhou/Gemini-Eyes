@@ -209,6 +209,18 @@ UNAVAILABLE_MODELS: dict[str, str] = {
     "carbon": "4 Carbon is Ultra-only; not available on this plan",
 }
 
+# Baked high-thinking model variants: name -> (base catalog key, thinking).
+# Exactly two, by approved scope: no low variants, no other bases, and the
+# process default (DEFAULT_THINKING = 2) is unchanged. The REST layer maps
+# these names onto their base model + this thinking level BEFORE validation,
+# so "gemini-pro-high" / "pro high" land here through _normalise_model_name.
+# The conversation fingerprint uses the BASE model name — the variant is an
+# equivalent upstream request, so it shares the base model's chain domain.
+MODEL_THINKING_VARIANTS: dict[str, tuple[str, int]] = {
+    "pro-high": ("pro", 2),
+    "argon-high": ("argon", 2),
+}
+
 # Native thinking levels (header index 15 / inner[80]):
 #   1 = standard, 2 = extended, 3 = deep think.
 # Level 3 ("Deep Think") is asynchronous: the first response is only a
