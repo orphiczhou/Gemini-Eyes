@@ -69,6 +69,46 @@ def test_generate_stream_events(monkeypatch):
     assert captured["prompt"] == "hi"
 
 
+def test_generate_stream_rest_frames_do_not_reset_baseline(monkeypatch):
+    """The web stream alternates content frames with empty rest frames; the
+    baseline must survive them (otherwise the next content frame re-emits
+    the whole answer — observed as "reply duplicated twice")."""
+    c = GeminiWebClient({"__Secure-1PSID": "x"})
+
+    def make_inner(text: str, completed: bool, with_candidates: bool = True) -> list:
+        inner: list = [None] * 43
+        inner[1] = ["c_1", "r_1"]
+        if with_candidates:
+            inner[4] = [["rc_1", [text], None, None, None, None, None, [2 if completed else 0]]]
+        inner[25] = "ctx" if completed else None
+        inner[42] = "4 Hydrogen"
+        return inner
+
+    seq = [
+        ["wrf.fr", "StreamGenerate", json.dumps(make_inner("Hel", False)), None],
+        ["wrf.fr", "StreamGenerate", json.dumps(make_inner("", False, with_candidates=False)), None],
+        ["wrf.fr", "StreamGenerate", json.dumps(make_inner("Hello world", True)), None],
+        ["wrf.fr", "StreamGenerate", json.dumps(make_inner("", False, with_candidates=False)), None],
+    ]
+
+    def stub_generate(prompt, metadata=None, files=None, model=None, thinking=None, on_frame=None):
+        from gemini_mcp.gemini_client import GenerationResult
+
+        r = GenerationResult()
+        for f in seq:
+            c._consume_frame(f, r)
+            if on_frame:
+                on_frame(f)
+        return r
+
+    monkeypatch.setattr(c, "generate", stub_generate)
+    events = list(c.generate_stream("hi"))
+    deltas = [e for e in events if e["type"] == "delta"]
+    assembled = "".join(e["text"] for e in deltas)
+    assert assembled == "Hello world", repr(assembled)
+    assert "Hello worldHello world" not in assembled
+
+
 def test_generate_stream_propagates_error(monkeypatch):
     c = GeminiWebClient({"__Secure-1PSID": "x"})
 

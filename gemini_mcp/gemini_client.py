@@ -993,7 +993,7 @@ class GeminiWebClient:
         the point of iteration.
         """
         events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-        state = {"text": "", "thoughts": ""}
+        state = {"text": "", "thoughts": "", "completed": False}
 
         def on_frame(frame: Any) -> None:
             if cancel is not None and cancel.is_set():
@@ -1003,19 +1003,29 @@ class GeminiWebClient:
             # exactly like the non-streaming path.
             shadow = GenerationResult()
             self._consume_frame(frame, shadow)
+            # Rest frames: the web stream alternates content frames with
+            # empty ones (no candidates → shadow collapses to zero). Diffing
+            # a zero snapshot would clear the baseline and make the next
+            # content frame re-emit the WHOLE answer (observed as "reply
+            # duplicated twice"). Empty frames only carry a completion flag.
+            if not shadow.text and not shadow.thoughts:
+                if shadow.completed:
+                    state["completed"] = True
+                return
+            if len(shadow.text) < len(state["text"]) and not shadow.completed:
+                return  # shorter snapshot mid-stream: regression, keep baseline
             text_delta, clean_snapshot = get_delta_by_fp_len(
-                shadow.text, state["text"], shadow.completed
+                shadow.text, state["text"], shadow.completed or state.get("completed", False)
             )
             thought_delta, clean_thoughts = get_delta_by_fp_len(
                 shadow.thoughts, state["thoughts"], True
             )
             if text_delta or thought_delta:
                 events.put(("delta", (text_delta, thought_delta)))
-            # Unconditionally adopt the cleaned snapshot as the new baseline —
-            # keeping a raw snapshot here poisoned the prefix fast-path and
-            # silently dropped deltas during code-fence flicker.
-            state["text"] = clean_snapshot
-            state["thoughts"] = clean_thoughts
+            # Baseline is monotonic: adopt the cleaned snapshot, never shrink
+            # below what was already sent.
+            state["text"] = clean_snapshot if len(clean_snapshot) >= len(state["text"]) else state["text"]
+            state["thoughts"] = clean_thoughts if len(clean_thoughts) >= len(state["thoughts"]) else state["thoughts"]
 
         def worker() -> None:
             try:
