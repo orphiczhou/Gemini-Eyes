@@ -59,6 +59,8 @@ from .server import (
     _metadata_for,
     _status_payload,
     _usage_payload,
+    conv_lookup,
+    conv_register,
 )
 
 _CREATED = int(time.time())
@@ -372,13 +374,29 @@ async def _chat(request: Request) -> JSONResponse:
     resp_id = body.get("gemini_response_id")
     thinking = _resolve_thinking(body)
 
-    prompt = _messages_to_prompt(messages, continue_conversation=bool(conv_id))
+    texts = _messages_to_texts(messages)
+    model_key = model_name or f"gemini-{DEFAULT_MODEL}"
+    # Session resolution: explicit id wins; otherwise fingerprint the history
+    # BEFORE the last user turn (the next request's parent key equals this
+    # turn's child key — see server.session_key). Miss → fresh conversation.
+    rec = None
+    if conv_id:
+        rec = conv_lookup(texts, model_key, conv_id)
+    else:
+        rec = conv_lookup(texts[:-1], model_key) if texts else None
+
+    prompt = _messages_to_prompt(messages, continue_conversation=rec is not None)
     if not prompt.strip():
         return _json_error(400, "invalid_request", "no user message content found in 'messages'")
 
-    meta = _metadata_for(conv_id, resp_id) if conv_id else None
+    if rec is not None:
+        meta = list(rec.metadata)
+        if conv_id and resp_id:
+            meta[1] = resp_id
+    else:
+        meta = _metadata_for(conv_id, resp_id) if conv_id else None
     if body.get("stream") is True or body.get("stream") == "true":
-        return _chat_stream(body, prompt, meta, model_name, thinking)
+        return _chat_stream(body, prompt, meta, model_name, thinking, texts)
     try:
         result = await run_in_threadpool(
             _generate_serialized, prompt, meta, None, model_name, thinking
@@ -394,6 +412,8 @@ async def _chat(request: Request) -> JSONResponse:
     # count-free so the MCP tool path (which counts in gemini_send_message)
     # and this path each report exactly once.
     usage.record_request(chars_in=len(prompt), chars_out=len(result.text))
+    clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
+    conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key))
     return JSONResponse(_chat_shell(str(requested_model or f"gemini-{DEFAULT_MODEL}"), prompt, result))
 
 
@@ -403,6 +423,7 @@ def _chat_stream(
     meta: Optional[list[Any]],
     model_name: Optional[str],
     thinking: Optional[Union[int, str]],
+    texts: Optional[list[str]] = None,
 ) -> StreamingResponse:
     """SSE stream: role frame, content/thinking deltas, ping keep-alives when
     the upstream stalls, final frame with the gemini extension, then [DONE].
@@ -456,6 +477,9 @@ def _chat_stream(
                     from .server import _remember
 
                     _remember(result)
+                    if texts is not None:
+                        clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
+                        conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key or f"gemini-{DEFAULT_MODEL}"))
                     yield frame(
                         {},
                         "stop",
@@ -489,6 +513,22 @@ def _chat_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _messages_to_texts(messages: list[dict[str, Any]]) -> list[str]:
+    """Flatten non-system messages into the ordered texts used for the
+    conversation fingerprint (role-prefixed, stripped)."""
+    texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user"))
+        if role == "system":
+            continue
+        text = _content_to_text(message.get("content")).strip()
+        if text:
+            texts.append(f"{role}: {text}")
+    return texts
 
 
 def _chat_shell(requested_model: str, prompt: str, result: Any) -> dict[str, Any]:

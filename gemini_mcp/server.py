@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import hmac
 import json
 import logging
@@ -38,6 +39,7 @@ import os
 import random
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -73,6 +75,96 @@ _metadata_cache: dict[str, list[Any]] = {}  # conversation_id -> metadata
 
 # How often to rotate __Secure-1PSIDTS in the background (seconds).
 _ROTATE_INTERVAL = 25 * 60
+
+# ---------------------------------------------------------------------------
+# Conversation session table (fingerprint chain for stateless clients)
+#
+# OpenAI clients (DSH) replay the full message history every turn and never
+# pass conversation ids. We fingerprint "the history BEFORE the last user
+# turn" (parent key) and "the history AFTER our reply" (child key): the next
+# request's parent key equals this turn's child key, which chains turns onto
+# one web-side conversation. A miss → fresh conversation with the full
+# history rendered as a transcript (semantically lossless, one extra turn).
+# ---------------------------------------------------------------------------
+
+_CONV_TTL = 90 * 60     # web-side conversations outlive several rotations
+_CONV_MAX = 200         # single-user daemon: plenty
+
+
+@dataclass
+class _ConvRecord:
+    metadata: list[Any]
+    model: Optional[str]
+    created_at: float
+    updated_at: float
+
+
+_conv_by_cid: dict[str, "_ConvRecord"] = {}
+_conv_by_key: dict[str, str] = {}  # fingerprint -> conversation_id
+
+
+def session_key(texts: list[str], model: str) -> str:
+    """Fingerprint an ordered history of flattened texts under one model."""
+    h = hashlib.sha256()
+    h.update(model.encode("utf-8", "ignore"))
+    for t in texts:
+        h.update(b"\x1e")
+        h.update(t.strip().encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def _conv_evict() -> None:
+    """TTL + max-entries eviction; fingerprint keys cleaned with records."""
+    now = time.time()
+    stale = [cid for cid, r in _conv_by_cid.items() if now - r.updated_at > _CONV_TTL]
+    for cid in stale:
+        _conv_by_cid.pop(cid, None)
+    if len(_conv_by_cid) > _CONV_MAX:
+        for cid, _ in sorted(_conv_by_cid.items(), key=lambda kv: kv[1].updated_at)[
+            : len(_conv_by_cid) - _CONV_MAX
+        ]:
+            _conv_by_cid.pop(cid, None)
+    if stale or len(_conv_by_cid) > _CONV_MAX:
+        for k in [k for k, cid in _conv_by_key.items() if cid not in _conv_by_cid]:
+            _conv_by_key.pop(k, None)
+
+
+def conv_register(result: Any, texts_after: list[str], model: str) -> str:
+    """Register a completed turn: cid record + parent/child fingerprint keys.
+
+    ``texts_after`` is the flattened history INCLUDING our reply — its
+    prefix minus the trailing assistant entry is this turn's parent key and
+    the whole list is the child key the NEXT request will fingerprint.
+    """
+    cid = result.conversation_id or ""
+    now = time.time()
+    if cid:
+        _conv_by_cid[cid] = _ConvRecord(
+            metadata=result.metadata or [], model=model, created_at=now, updated_at=now
+        )
+    if len(texts_after) >= 1:
+        _conv_by_key[session_key(texts_after[:-1], model)] = cid
+    _conv_by_key[session_key(texts_after, model)] = cid
+    _conv_evict()
+    return cid
+
+
+def conv_lookup(texts: list[str], model: str, conv_id: Optional[str] = None) -> Optional["_ConvRecord"]:
+    """Find a live record by explicit id, else by the parent fingerprint."""
+    if conv_id:
+        rec = _conv_by_cid.get(conv_id)
+        if rec and time.time() - rec.updated_at <= _CONV_TTL:
+            return rec
+        return None
+    if not texts:
+        return None
+    cid = _conv_by_key.get(session_key(texts, model))
+    if not cid:
+        return None
+    rec = _conv_by_cid.get(cid)
+    if rec and time.time() - rec.updated_at <= _CONV_TTL:
+        return rec
+    return None
 
 # Single-cookie single-writer: the web session must not be driven
 # concurrently (review-20261102 P1-1). stdio was naturally serial; both the
