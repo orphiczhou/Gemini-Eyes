@@ -96,6 +96,41 @@ def test_error_response_transport_and_generic():
 
 
 # ---------------------------------------------------------------------------
+# /v1/models payload: plan blocklist + protocol capabilities
+# ---------------------------------------------------------------------------
+
+
+def test_models_payload_carbon_blocked_and_capabilities(monkeypatch):
+    from types import SimpleNamespace
+
+    from gemini_mcp import api
+
+    monkeypatch.setattr(
+        api, "_get_client", lambda: SimpleNamespace(model_registry_snapshot=lambda: None)
+    )
+    payload = api._models_payload()
+    carbon = next(m for m in payload["data"] if m["id"] == "gemini-carbon")
+    assert carbon["available"] is False
+    assert "Ultra-only" in carbon["unavailable_reason"]
+    # servable entries carry no availability marker at all
+    others = [m for m in payload["data"] if m["id"] != "gemini-carbon"]
+    assert others and all("available" not in m for m in others)
+    assert payload["capabilities"] == {"function_calling": False}
+    # aliases advertise the honest target: UI names for carbon point at carbon
+    assert payload["gemini"]["model_aliases"]["4-carbon"] == "carbon"
+    assert payload["gemini"]["model_aliases"]["高难任务"] == "carbon"
+
+
+def test_carbon_alias_resolution():
+    from gemini_mcp.gemini_client import _normalise_model_name
+
+    assert _normalise_model_name("carbon") == "carbon"
+    assert _normalise_model_name("gemini-4-carbon") == "carbon"
+    assert _normalise_model_name("4-carbon") == "carbon"
+    assert _normalise_model_name("高难任务") == "carbon"
+
+
+# ---------------------------------------------------------------------------
 # per-request model chain rebuild
 # ---------------------------------------------------------------------------
 

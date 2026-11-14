@@ -177,12 +177,14 @@ MODEL_ALIASES: dict[str, str] = {
     "快速解答": "flash-lite-basic",
     "日常帮助": "flash",
     "深度研究": "pro",
-    "高难任务": "argon",
+    # "高难任务" (the UI entry under 4 Carbon) and "4-carbon" resolve to the
+    # carbon catalog entry itself, NOT to argon: they are rejected up front by
+    # the REST facade via UNAVAILABLE_MODELS (Ultra-only, stalls this plan).
+    "高难任务": "carbon",
     "3.5-flash-lite": "flash-lite",
     "4-hydrogen": "flash",
     "hydrogen": "flash",
-    "4-carbon": "argon",
-    "carbon": "argon",
+    "4-carbon": "carbon",
     "legacy": "legacy",
     "default": "legacy",
     "off": "legacy",
@@ -198,6 +200,14 @@ DEFAULT_MODEL = "argon"
 # the chain below is what the client actually walks.
 DEFAULT_MODEL_FALLBACK = "pro"
 DEFAULT_MODEL_FALLBACK_CHAIN: tuple[str, ...] = ("pro", "flash-basic")
+
+# Plan-availability blocklist: catalog keys a Pro-plan account can never be
+# served. Names resolving here are rejected by the REST facade up front
+# (HTTP 400 model_unavailable) instead of stalling the stream for minutes —
+# a Pro account silently queues on Ultra-only models and never gets a frame.
+UNAVAILABLE_MODELS: dict[str, str] = {
+    "carbon": "4 Carbon is Ultra-only; not available on this plan",
+}
 
 # Native thinking levels (header index 15 / inner[80]):
 #   1 = standard, 2 = extended, 3 = deep think.

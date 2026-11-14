@@ -51,6 +51,7 @@ from .gemini_client import (
     MODEL_ALIASES,
     MODEL_CATALOG,
     THINKING_LEVELS,
+    UNAVAILABLE_MODELS,
     _normalise_model_name,
 )
 from .server import (
@@ -277,15 +278,18 @@ async def _healthz(request: Request) -> JSONResponse:
 def _models_payload() -> dict[str, Any]:
     data = []
     for name, (model_id, capacity, number) in MODEL_CATALOG.items():
-        data.append(
-            {
-                "id": f"gemini-{name}",
-                "object": "model",
-                "created": _CREATED,
-                "owned_by": "gemini-web",
-                "gemini": {"capacity": capacity, "mode_number": number},
-            }
-        )
+        entry = {
+            "id": f"gemini-{name}",
+            "object": "model",
+            "created": _CREATED,
+            "owned_by": "gemini-web",
+            "gemini": {"capacity": capacity, "mode_number": number},
+        }
+        if name in UNAVAILABLE_MODELS:
+            # Plan blocklist: listed for roster transparency, never servable.
+            entry["available"] = False
+            entry["unavailable_reason"] = UNAVAILABLE_MODELS[name]
+        data.append(entry)
     data.append(
         {
             "id": "gemini-legacy",
@@ -298,6 +302,10 @@ def _models_payload() -> dict[str, Any]:
     out: dict[str, Any] = {
         "object": "list",
         "data": data,
+        # Protocol capabilities this facade actually supports. The web backend
+        # has no tool channel, so tool/function traffic is sanitized away
+        # (see _sanitize_messages) instead of being half-honoured.
+        "capabilities": {"function_calling": False},
         "gemini": {
             "default_model": f"gemini-{DEFAULT_MODEL}",
             "default_thinking": DEFAULT_THINKING,
@@ -367,6 +375,15 @@ async def _chat(request: Request) -> JSONResponse:
                 400,
                 "unknown_model",
                 f"unknown model {requested_model!r}; see GET /v1/models",
+            )
+        # Plan-availability gate (Ultra-only tiers would stall the stream for
+        # minutes on this plan — reject before any upstream traffic).
+        if key in UNAVAILABLE_MODELS:
+            return _json_error(
+                400,
+                "model_unavailable",
+                f"{UNAVAILABLE_MODELS[key]}. Try gemini-argon or gemini-pro "
+                "instead (see GET /v1/models).",
             )
         model_name = key
 
