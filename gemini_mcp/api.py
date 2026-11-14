@@ -265,7 +265,11 @@ async def _index(request: Request) -> JSONResponse:
 
 
 async def _healthz(request: Request) -> JSONResponse:
-    return JSONResponse(await run_in_threadpool(_healthz_payload))
+    # Deliberately NOT via run_in_threadpool: during an upstream stall the
+    # threadpool can be saturated by hung streams, and the health probe is
+    # the one endpoint that must stay reachable (it is memory-only once the
+    # client is constructed).
+    return JSONResponse(_healthz_payload())
 
 
 def _models_payload() -> dict[str, Any]:
@@ -359,7 +363,7 @@ async def _chat(request: Request) -> JSONResponse:
         return _json_error(400, "invalid_request", "no user message content found in 'messages'")
 
     meta = _metadata_for(conv_id, resp_id) if conv_id else None
-    if body.get("stream"):
+    if body.get("stream") is True or body.get("stream") == "true":
         return _chat_stream(body, prompt, meta, model_name, thinking)
     try:
         result = await run_in_threadpool(
@@ -386,11 +390,15 @@ def _chat_stream(
     model_name: Optional[str],
     thinking: Optional[Union[int, str]],
 ) -> StreamingResponse:
-    """SSE stream: role frame, content/thinking deltas, final frame with the
-    gemini extension (conversation ids, served model), then [DONE]."""
+    """SSE stream: role frame, content/thinking deltas, ping keep-alives when
+    the upstream stalls, final frame with the gemini extension, then [DONE].
+    Client disconnect cancels the upstream call at the next frame boundary."""
     requested_model = str(body.get("model") or f"gemini-{DEFAULT_MODEL}")
     client = _get_client()
-    gen = client.generate_stream(prompt, metadata=meta, model=model_name, thinking=thinking)
+    cancel = __import__("threading").Event()
+    gen = client.generate_stream(
+        prompt, metadata=meta, model=model_name, thinking=thinking, cancel=cancel
+    )
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     sent_chars = {"out": 0}
@@ -408,9 +416,12 @@ def _chat_stream(
         return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
     async def sse() -> Any:
-        yield frame({"role": "assistant", "content": ""})
         try:
+            yield frame({"role": "assistant", "content": ""})
             async for item in iterate_in_threadpool(gen):
+                if item["type"] == "ping":
+                    yield ": ping\n\n"  # SSE comment: proxies and clients see liveness
+                    continue
                 if item["type"] == "delta":
                     delta: dict[str, Any] = {}
                     if item["text"]:
@@ -428,6 +439,9 @@ def _chat_stream(
                 else:
                     result = item["result"]
                     usage.record_request(chars_in=len(prompt), chars_out=len(result.text))
+                    from .server import _remember
+
+                    _remember(result)
                     yield frame(
                         {},
                         "stop",
@@ -449,6 +463,11 @@ def _chat_stream(
                 'data: {"error": {"message": "unexpected server failure", '
                 '"type": "internal_error", "code": "internal_error"}}\n\n'
             )
+        finally:
+            # Consumer gone (or stream finished): stop the upstream at the
+            # next frame boundary instead of letting it hold the generate
+            # lock for minutes burning quota on a dead connection.
+            cancel.set()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

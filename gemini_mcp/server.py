@@ -378,7 +378,8 @@ def _status_payload() -> dict[str, Any]:
         return status
     try:
         client = _get_client()
-        client.init(force=True)
+        with _GENERATE_LOCK:  # init() drives the shared session (real GET)
+            client.init(force=True)
         status["ok"] = True
         status["token_fetched"] = True
         status["language"] = client.language
@@ -461,18 +462,26 @@ def _usage_payload() -> dict[str, Any]:
             "persist_to": _cookie_file_path() if _cookies_from_file else None,
         }
         server: dict[str, Any] = {}
-        try:
-            # Account RPCs drive the same requests.Session as generate(); take
-            # the generate lock so jar/reqid state stays single-writer.
-            with _GENERATE_LOCK:
-                server["quotas"] = client.fetch_quota()
-        except Exception as e:  # noqa: BLE001 - per-source degradation
-            server["quotas_error"] = str(e)
-        try:
-            with _GENERATE_LOCK:
-                server["usage_info"] = client.fetch_usage_info()
-        except Exception as e:  # noqa: BLE001 - per-source degradation
-            server["usage_info_error"] = str(e)
+        # Account RPCs drive the same requests.Session as generate(). Try to
+        # take the generate lock without blocking: a hung/slow generate must
+        # NOT stall usage queries (observed: 45s+ block during an upstream
+        # stall). Busy → degrade to local-only accounting immediately.
+        got_lock = _GENERATE_LOCK.acquire(blocking=False)
+        if not got_lock:
+            server["ok"] = False
+            server["reason"] = "generate in progress; server quota skipped this call"
+        else:
+            try:
+                try:
+                    server["quotas"] = client.fetch_quota()
+                except Exception as e:  # noqa: BLE001 - per-source degradation
+                    server["quotas_error"] = str(e)
+                try:
+                    server["usage_info"] = client.fetch_usage_info()
+                except Exception as e:  # noqa: BLE001 - per-source degradation
+                    server["usage_info_error"] = str(e)
+            finally:
+                _GENERATE_LOCK.release()
         server["ok"] = bool(server.get("quotas") or server.get("usage_info"))
         levels: list[float] = []
         for bucket in server.get("quotas", {}).values():
@@ -819,7 +828,8 @@ def gemini_download_media(
     """
     if not url or not save_path:
         raise ValueError("url and save_path must not be empty")
-    path = _get_client().download_media(url, save_path)
+    with _GENERATE_LOCK:  # shared session: single-writer with generate
+        path = _get_client().download_media(url, save_path)
     return {"path": path}
 
 
@@ -837,7 +847,8 @@ def _with_saved_media(
         ext = ".mp4" if m["kind"] == "generated_video" else ".png"
         dest = os.path.join(save_dir, f"{m['kind']}_{result.conversation_id or 'new'}_{i}{ext}")
         try:
-            local = _get_client().download_media(m["url"], dest)
+            with _GENERATE_LOCK:
+                local = _get_client().download_media(m["url"], dest)
             m["local_path"] = local
             saved.append(m)
         except Exception as e:  # noqa: BLE001 - report download failure, keep URL
@@ -859,7 +870,8 @@ def gemini_list_conversations(limit: int = 13) -> list[dict[str, Any]]:
     """
     if not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
-    return _get_client().list_conversations(limit=limit)
+    with _GENERATE_LOCK:  # shared session: single-writer with generate
+        return _get_client().list_conversations(limit=limit)
 
 
 @mcp.tool()
@@ -875,7 +887,8 @@ def gemini_read_conversation(conversation_id: str, limit: int = 10) -> dict[str,
     """
     if not conversation_id:
         raise ValueError("conversation_id must not be empty")
-    return _get_client().read_conversation(conversation_id, limit=limit)
+    with _GENERATE_LOCK:
+        return _get_client().read_conversation(conversation_id, limit=limit)
 
 
 @mcp.tool()
@@ -887,7 +900,8 @@ def gemini_delete_conversation(conversation_id: str) -> dict[str, str]:
     """
     if not conversation_id:
         raise ValueError("conversation_id must not be empty")
-    _get_client().delete_conversation(conversation_id)
+    with _GENERATE_LOCK:
+        _get_client().delete_conversation(conversation_id)
     _metadata_cache.pop(conversation_id, None)
     return {"deleted": conversation_id}
 

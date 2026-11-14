@@ -920,9 +920,12 @@ class GeminiWebClient:
         without a completion marker (Google silently cuts some streams even
         though the full answer was persisted on its side).
 
-        Only acts when we captured partial text and the history holds a
-        longer model turn for the same conversation; Deep Think placeholders
-        (history still shows the same placeholder) are left untouched.
+        Guards, in order of importance: only the **newest** model turn is
+        considered (read_conversation returns newest first, and each turn
+        expands to [user, model] entries — scanning all turns could adopt the
+        previous answer); the recovered turn must be longer than what we
+        captured; and only a turn the server marks complete (status 2) may
+        set ``completed`` — an in-progress history entry stays unrecovered.
         """
         if result.completed or not result.conversation_id or not result.text:
             return result
@@ -930,15 +933,26 @@ class GeminiWebClient:
             history = self.read_conversation(result.conversation_id, limit=2)
         except GeminiWebError:
             return result  # diagnostics only — never mask the partial answer
-        best = ""
+        recovered = None
         for turn in history.get("turns", []):
             if turn.get("role") == "model":
-                text = str(turn.get("text") or "")
-                if len(text) > len(best):
-                    best = text
-        if len(best) > len(result.text):
-            result.text = best
+                recovered = turn  # newest model turn (list is newest-first)
+                break
+        if not recovered:
+            return result
+        text = str(recovered.get("text") or "")
+        if len(text) <= len(result.text):
+            return result  # nothing longer persisted — keep our partial
+        result.text = text
+        status = recovered.get("status")
+        if status == 2:
             result.completed = True
+        rid = recovered.get("response_id")
+        rcid = recovered.get("candidate_id")
+        if rid:
+            result.response_id = str(rid)
+        if rcid:
+            result.candidate_id = str(rcid)
         return result
 
     def generate_stream(
@@ -948,35 +962,51 @@ class GeminiWebClient:
         files: Optional[list[str]] = None,
         model: Optional[str] = None,
         thinking: Optional[Union[int, str]] = None,
+        cancel: Optional[threading.Event] = None,
+        ping_interval: float = 20.0,
     ) -> Iterator[dict[str, Any]]:
         """Yield incremental deltas for one generate() call.
 
         Events, in order:
           {"type": "delta", "text": str, "thoughts": str}  — either field may be ""
-          {"type": "final", "result": GenerationResult}    — terminal
+          {"type": "ping"}                                  — no upstream progress within ping_interval
+          {"type": "final", "result": GenerationResult}     — terminal
 
         The blocking generate() runs on a worker thread under GENERATE_LOCK;
         on_frame snapshots are fed through the same candidate slots the
-        non-streaming path uses and diffed into safe increments (full-snapshot
-        frames plus flicker-safe tail alignment). Errors raised on the worker
-        are re-raised on the consumer thread at the point of iteration.
+        non-streaming path uses and diffed into safe increments. The diff
+        baseline stores the *cleaned* snapshot and is updated unconditionally
+        (reference semantics), so markdown-flicker frames cannot poison it.
+        ``cancel`` is polled on every frame — set it when the consumer goes
+        away to stop the upstream call at the next frame boundary. A stalled
+        upstream produces ping events instead of an indefinite silent wait.
+        Errors raised on the worker are re-raised on the consumer thread at
+        the point of iteration.
         """
         events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         state = {"text": "", "thoughts": ""}
 
         def on_frame(frame: Any) -> None:
+            if cancel is not None and cancel.is_set():
+                raise GeminiWebError("stream cancelled by client", transport=True)
+            # Errors from error-frames must NOT be swallowed here: raising
+            # lets generate()'s degradation chain / retry layer handle them
+            # exactly like the non-streaming path.
             shadow = GenerationResult()
-            try:
-                self._consume_frame(frame, shadow)
-            except GeminiWebError as exc:
-                events.put(("error", exc))
-                return
-            text_delta, _ = get_delta_by_fp_len(shadow.text, state["text"], shadow.completed)
-            thought_delta, _ = get_delta_by_fp_len(shadow.thoughts, state["thoughts"], True)
+            self._consume_frame(frame, shadow)
+            text_delta, clean_snapshot = get_delta_by_fp_len(
+                shadow.text, state["text"], shadow.completed
+            )
+            thought_delta, clean_thoughts = get_delta_by_fp_len(
+                shadow.thoughts, state["thoughts"], True
+            )
             if text_delta or thought_delta:
-                state["text"] = shadow.text
-                state["thoughts"] = shadow.thoughts
                 events.put(("delta", (text_delta, thought_delta)))
+            # Unconditionally adopt the cleaned snapshot as the new baseline —
+            # keeping a raw snapshot here poisoned the prefix fast-path and
+            # silently dropped deltas during code-fence flicker.
+            state["text"] = clean_snapshot
+            state["thoughts"] = clean_thoughts
 
         def worker() -> None:
             try:
@@ -996,14 +1026,24 @@ class GeminiWebClient:
 
         threading.Thread(target=worker, daemon=True).start()
         while True:
-            kind, payload = events.get()
+            try:
+                kind, payload = events.get(timeout=ping_interval)
+            except queue.Empty:
+                yield {"type": "ping"}
+                continue
             if kind == "delta":
                 text_delta, thought_delta = payload
                 yield {"type": "delta", "text": text_delta, "thoughts": thought_delta}
             elif kind == "error":
                 raise payload
             else:
-                yield {"type": "final", "result": payload}
+                # Final rebase: recovery (or the completed frame) may hold more
+                # text than the last delta sent — emit the remainder first.
+                result = payload
+                tail_delta, _ = get_delta_by_fp_len(result.text, state["text"], True)
+                if tail_delta:
+                    yield {"type": "delta", "text": tail_delta, "thoughts": ""}
+                yield {"type": "final", "result": result}
                 return
 
     def _generate_once(
