@@ -227,7 +227,11 @@ def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for message in messages:
         if not isinstance(message, dict):
             continue
-        role = str(message.get("role", "user"))
+        # Normalize case/whitespace before role checks: clients send "Tool",
+        # "FUNCTION", " assistant" etc., and those variants must not slip
+        # tool traffic past the sanitizer. The outgoing message dict keeps
+        # its original role spelling (prompt rendering is unchanged).
+        role = str(message.get("role", "user")).strip().lower()
         if role in _TOOL_ROLES:
             continue
         if role != "assistant":
@@ -404,7 +408,9 @@ def _models_payload() -> dict[str, Any]:
     ]
     out["gemini"]["discovered_note"] = (
         "discovered.models 来自账号实时发现：name=界面模型名（如 4 Carbon），"
-        "display_name=界面选项名（如 高难任务），二者均可作 model 参数"
+        "display_name=界面选项名（如 高难任务），二者均可作 model 参数传入，"
+        "但受套餐门禁约束：Ultra-only 模型（如 4 Carbon/高难任务→carbon）会被拒绝"
+        "（400 model_unavailable，见 available:false 条目）"
     )
     # Live account discovery (otAQ7b): served from the client-side cache
     # warmed by the background prewarm thread at startup. NEVER discovered
@@ -592,6 +598,10 @@ def _chat_stream(
     sent_chars = {"out": 0}
     ev = event_logger()
     started = started if started is not None else float(created)
+    # Bookkeeping for the finally block: which terminal state did we reach?
+    # (final frame / an error frame already logged / neither — the consumer
+    # vanished mid-stream and GeneratorExit unwound through the finally).
+    state = {"final": False, "error_logged": False}
 
     def frame(delta: dict[str, Any], finish: Optional[str] = None, extra: Optional[dict[str, Any]] = None) -> str:
         payload: dict[str, Any] = {
@@ -644,6 +654,7 @@ def _chat_stream(
                     if texts is not None:
                         clean_text = _FOLLOWUP_RE.sub("", result.text).strip()
                         conv_register(result, texts + [f"assistant: {clean_text}"], str(model_key or DEFAULT_MODEL))
+                    state["final"] = True
                     yield frame(
                         {},
                         "stop",
@@ -659,6 +670,7 @@ def _chat_stream(
             usage.record_error()
             error = _gemini_error_response(exc)
             _log_request_error(model_key or "-", error)
+            state["error_logged"] = True
             yield "data: " + json.dumps(json.loads(error.body.decode("utf-8")), ensure_ascii=False) + "\n\n"
         except Exception:  # noqa: BLE001 - never leak internals into the stream
             usage.record_error()
@@ -666,6 +678,7 @@ def _chat_stream(
                 "request_error model=%s stream=true code=internal_error http_status=200",
                 model_key or "-",
             )
+            state["error_logged"] = True
             yield (
                 'data: {"error": {"message": "unexpected server failure", '
                 '"type": "internal_error", "code": "internal_error"}}\n\n'
@@ -675,6 +688,18 @@ def _chat_stream(
             # next frame boundary instead of letting it hold the generate
             # lock for minutes burning quota on a dead connection.
             cancel.set()
+            if not state["final"] and not state["error_logged"]:
+                # GeneratorExit unwound us: the client disconnected before any
+                # terminal frame. No SSE error frame is possible (yielding in
+                # a closed generator is illegal) — close the event-log
+                # bookkeeping instead of leaving the request forever open.
+                usage.record_error()
+                ev.info(
+                    "request_error model=%s stream=true code=client_disconnected "
+                    "http_status=200 chars_out=%d",
+                    model_key or "-",
+                    sent_chars["out"],
+                )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

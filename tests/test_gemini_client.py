@@ -748,6 +748,151 @@ def test_resolve_thinking_level_3_refused(raw):
         resolve_thinking_level(raw)
 
 
+@pytest.mark.parametrize("name", ["carbon", "4-carbon", "gemini-4-carbon", "高难任务"])
+def test_resolve_model_setting_refuses_plan_blocked_models(name):
+    """P1-B: the catalog-level gate covers the MCP tools and GEMINI_MODEL —
+    a Pro account would wait forever on those tiers (silently queued)."""
+    with pytest.raises(GeminiWebError) as exc:
+        resolve_model_setting(name)
+    assert "Ultra-only" in str(exc.value)
+    assert "gemini-argon" in str(exc.value)
+
+
+def test_client_generate_refuses_carbon_per_call(monkeypatch):
+    """MCP path: gemini_send_message(model=...) funnels into generate() —
+    the refusal must fire before any POST leaves the building."""
+    posts: list[str] = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, **kw):
+            posts.append(url)
+            raise AssertionError("plan-blocked model must never reach the wire")
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})  # default argon: fine
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("hi", model="高难任务")
+    assert "Ultra-only" in str(exc.value)
+    assert posts == []
+
+
+def test_env_carbon_model_refused_at_client_construction(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODEL", "carbon")
+    with pytest.raises(GeminiWebError, match="Ultra-only"):
+        GeminiWebClient({})
+
+
+def test_env_carbon_in_fallback_chain_refused(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODEL", "pro")
+    monkeypatch.setenv("GEMINI_MODEL_FALLBACK", "carbon,flash")
+    with pytest.raises(GeminiWebError, match="Ultra-only"):
+        GeminiWebClient({})
+
+
+# ---------------------------------------------------------------------------
+# P2-I: error messages must not carry upstream response fragments
+# ---------------------------------------------------------------------------
+
+
+def test_upload_error_messages_carry_no_response_body(monkeypatch, tmp_path):
+    """Upload failures phrase themselves in HTTP codes only — response text
+    could otherwise reach the sanitized event log via tracebacks."""
+    img = tmp_path / "photo.png"
+    img.write_bytes(b"png")
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, headers=None, data=None, **kw):
+            # bodies full of SECRET markers for every failure shape
+            return type("R", (), {
+                "status_code": 400,
+                "headers": {},
+                "text": "SECRET-UPSTREAM-BODY",
+            })()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    with pytest.raises(GeminiWebError) as exc:
+        client.upload_file(str(img))
+    assert "SECRET-UPSTREAM-BODY" not in str(exc.value)
+    assert "HTTP 400" in str(exc.value)
+
+
+def test_upload_unexpected_response_message_carry_no_identifier(monkeypatch, tmp_path):
+    img = tmp_path / "photo.png"
+    img.write_bytes(b"png")
+
+    state = {"calls": 0}
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, headers=None, data=None, **kw):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return type("R", (), {
+                    "status_code": 200,
+                    "headers": {"x-goog-upload-url": "https://upload.example/up"},
+                    "text": "",
+                })()
+            return type("R", (), {"status_code": 200, "headers": {}, "text": "SECRET-IDENTIFIER"})()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    with pytest.raises(GeminiWebError) as exc:
+        client.upload_file(str(img))
+    assert "SECRET-IDENTIFIER" not in str(exc.value)
+
+
+def test_media_download_error_message_carry_no_url(monkeypatch, tmp_path):
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            if "gemini.google.com" in url:
+                return _ModelFakeInit()
+            return type("R", (), {
+                "status_code": 404,
+                "headers": {},
+                "text": "",
+                "__enter__": lambda s: s,
+                "__exit__": lambda s, *a: False,
+            })()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    monkeypatch.setattr("gemini_mcp.gemini_client.time.sleep", lambda s: None)
+    client = GeminiWebClient({})
+    secret_url = "http://googleusercontent.com/SECRET-PATH/img.png"
+    with pytest.raises(GeminiWebError) as exc:
+        client.download_media(secret_url, str(tmp_path / "out"), retries=1, retry_delay=0)
+    assert "SECRET-PATH" not in str(exc.value)
+    assert "HTTP 404" in str(exc.value)
+
+
 def test_generate_sends_model_header_and_payload_slots(monkeypatch):
     captured = []
     client = _model_client(
@@ -1208,6 +1353,92 @@ def test_watchdog_read_timeout_is_stall_not_transport(monkeypatch):
     assert exc.value.transport is False
     assert exc.value.is_retryable is False
     assert len(posts) == 1  # not retried, unlike plain transport errors
+
+
+def test_watchdog_body_read_timeout_wrapped_as_connection_error(monkeypatch):
+    """P1-A regression: requests wraps BODY-phase read timeouts as
+    ConnectionError (models.py: except ReadTimeoutError as e: raise
+    ConnectionError(e)) — the wrapper's __cause__ is None, the urllib3 error
+    lands in __context__. The watchdog must still classify it as a stall,
+    not a retryable transport error."""
+    import requests as requests_module
+    import urllib3.exceptions as urllib3_exc
+
+    monkeypatch.delenv("GEMINI_STALL_TIMEOUT", raising=False)
+    monkeypatch.delenv("GEMINI_TOTAL_TIMEOUT", raising=False)
+
+    def raise_wrapped_body_timeout(n):
+        try:
+            raise urllib3_exc.ReadTimeoutError(None, "/", "Read timed out. (read timeout=120)")
+        except urllib3_exc.ReadTimeoutError as cause:
+            # exactly what requests.models.iter_content does mid-body
+            raise requests_module.ConnectionError(cause)
+
+    client, posts = _watchdog_client(
+        monkeypatch, raise_wrapped_body_timeout, model="legacy"
+    )
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("ping")
+    assert exc.value.stall is True
+    assert exc.value.is_retryable is False
+    assert "Ultra-only" in str(exc.value)
+    # one POST only: without the fix this retried twice (2 x 120s) under the
+    # generate lock and finally surfaced as a misleading 502
+    assert len(posts) == 1
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    ["read_timeout", "wrapped_connection_error"],
+)
+def test_watchdog_disabled_read_timeouts_are_transport(monkeypatch, wrapper):
+    """P2-C: GEMINI_STALL_TIMEOUT=0 disables the stall clamp — read timeouts
+    (both shapes) fall back to ordinary retryable transport semantics."""
+    import requests as requests_module
+    import urllib3.exceptions as urllib3_exc
+
+    monkeypatch.setenv("GEMINI_STALL_TIMEOUT", "0")
+
+    def raise_read_timeout(n):
+        raise requests_module.ReadTimeout("read timed out")
+
+    def raise_wrapped(n):
+        try:
+            raise urllib3_exc.ReadTimeoutError(None, "/", "Read timed out.")
+        except urllib3_exc.ReadTimeoutError as cause:
+            raise requests_module.ConnectionError(cause)
+
+    factory = raise_read_timeout if wrapper == "read_timeout" else raise_wrapped
+    client, posts = _watchdog_client(monkeypatch, factory, model="legacy")
+    monkeypatch.setattr("gemini_mcp.gemini_client.time.sleep", lambda s: None)
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("ping")
+    assert exc.value.stall is False
+    assert exc.value.transport is True
+    assert exc.value.is_retryable is True
+    assert len(posts) == 3  # original + 2 bounded retries (legacy chain)
+
+
+def test_is_body_read_timeout_shape_detection():
+    import requests as requests_module
+    import urllib3.exceptions as urllib3_exc
+    from gemini_mcp.gemini_client import _is_body_read_timeout
+
+    try:
+        raise urllib3_exc.ReadTimeoutError(None, "/", "Read timed out.")
+    except urllib3_exc.ReadTimeoutError as cause:
+        wrapped = requests_module.ConnectionError(cause)
+    try:
+        raise wrapped
+    except requests_module.ConnectionError as exc_with_context:
+        assert _is_body_read_timeout(exc_with_context) is True
+    # message-only shape (cause/context stripped by serialization)
+    assert _is_body_read_timeout(requests_module.ConnectionError("Read timed out. (read timeout=5)"))
+    # a reset or connect timeout must NOT match
+    assert not _is_body_read_timeout(requests_module.ConnectionError("Connection aborted."))
+    assert not _is_body_read_timeout(requests_module.ConnectionError("Connection timed out"))
+    assert not _is_body_read_timeout(requests_module.ConnectTimeout("connect timed out"))
+    assert not _is_body_read_timeout(requests_module.ConnectionError("reset by peer"))
 
 
 def test_cancelled_stream_is_not_retried(monkeypatch):

@@ -130,6 +130,43 @@ def test_sanitize_non_dict_entries_skipped():
     assert out == [{"role": "user", "content": "hi"}]
 
 
+def test_sanitize_role_case_variants():
+    """P2-E: 'Tool'/'FUNCTION'/' Assistant ' must not slip past the filter —
+    role matching is case- and whitespace-insensitive (original spelling of
+    kept messages is preserved for prompt rendering)."""
+    from gemini_mcp.api import _sanitize_messages
+
+    msgs = [
+        {"role": "Tool", "content": "tool payload A"},
+        {"role": "FUNCTION", "content": "legacy payload B"},
+        {"role": " Assistant ", "content": "", "tool_calls": [{"id": "c"}]},
+        {"role": "User", "content": "kept"},
+        {"role": "SYSTEM", "content": "kept too"},
+    ]
+    out = _sanitize_messages(msgs)
+    assert out == [
+        {"role": "User", "content": "kept"},
+        {"role": "SYSTEM", "content": "kept too"},
+    ]
+
+
+def test_sanitize_assistant_case_variant_strips_tool_calls():
+    from gemini_mcp.api import _sanitize_messages
+
+    msgs = [
+        {
+            "role": "Assistant",
+            "content": "text survives",
+            "tool_calls": [{"id": "c", "function": {"name": "f"}}],
+        }
+    ]
+    out = _sanitize_messages(msgs)
+    assert len(out) == 1
+    assert out[0]["content"] == "text survives"
+    assert "tool_calls" not in out[0]
+    assert out[0]["role"] == "Assistant"  # spelling preserved
+
+
 # ---------------------------------------------------------------------------
 # thinking resolution
 # ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@ reply bodies must never appear in the file.
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 from pathlib import Path
 
 import pytest
@@ -110,4 +112,141 @@ def test_configure_failure_returns_none(tmp_path, monkeypatch):
     blocked.mkdir()
     monkeypatch.setenv("GEMINI_LOG_FILE", str(blocked))
     assert configure_event_logging() is None
+    eventlog.reset_event_logging()
+
+
+# ---------------------------------------------------------------------------
+# P2-H: the lazy path must give up after one failed configuration
+# ---------------------------------------------------------------------------
+
+
+def test_lazy_configure_fails_once_not_forever(tmp_path, monkeypatch):
+    blocked = tmp_path / "blocked.log"
+    blocked.mkdir()
+    monkeypatch.setenv("GEMINI_LOG_FILE", str(blocked))
+
+    attempts = {"n": 0}
+    real_mkdir = eventlog.Path.mkdir
+
+    def counting_mkdir(self, *a, **kw):
+        attempts["n"] += 1
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(eventlog.Path, "mkdir", counting_mkdir)
+
+    assert configure_event_logging() is None  # attempt 1: fails, sticks
+    assert eventlog._lazy_disabled is True
+    for _ in range(5):
+        eventlog.event_logger()  # lazy: must NOT retry mkdir/open
+    assert attempts["n"] == 1
+
+    # explicit reconfigure still retries and recovers (operator fixed env)
+    good = tmp_path / "fixed.log"
+    monkeypatch.setenv("GEMINI_LOG_FILE", str(good))
+    assert configure_event_logging() == good
+    assert eventlog._lazy_disabled is False
+    eventlog.reset_event_logging()
+
+
+def test_concurrent_first_touch_mounts_one_handler(tmp_path, monkeypatch):
+    """Concurrent lazy configuration must mount exactly one rotating handler
+    (a check-then-attach race would double-log and double-hold the file)."""
+    import threading
+
+    path = tmp_path / "events.log"
+    monkeypatch.setenv("GEMINI_LOG_FILE", str(path))
+    eventlog.reset_event_logging()
+    barrier = threading.Barrier(8)
+
+    def touch():
+        barrier.wait()
+        eventlog.event_logger().info("concurrent first touch")
+
+    threads = [threading.Thread(target=touch) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    handlers = [
+        h
+        for h in logging.getLogger("gemini_mcp").handlers
+        if isinstance(h, logging.handlers.RotatingFileHandler)
+    ]
+    assert len(handlers) == 1
+    eventlog.reset_event_logging()
+
+
+# ---------------------------------------------------------------------------
+# P2-F: a mid-stream client disconnect must close the event-log bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_stream_disconnect_logs_client_disconnected(tmp_path, monkeypatch):
+    """Consumer vanishes mid-SSE (GeneratorExit): no terminal frame is ever
+    produced, and the finally block must record code=client_disconnected."""
+    import asyncio
+
+    import gemini_mcp.api as api
+    from test_sessions import _FakeRequest
+
+    path = tmp_path / "disc.log"
+    monkeypatch.setenv("GEMINI_LOG_FILE", str(path))
+    assert configure_event_logging() == path
+
+    class _DeltaOnlyClient:
+        def generate_stream(self, *args, **kwargs):
+            yield {"type": "delta", "text": "partial ", "thoughts": ""}
+            # final never arrives before the consumer walks away
+            import time as _t
+
+            _t.sleep(30)
+
+    monkeypatch.setattr(api, "_get_client", lambda: _DeltaOnlyClient())
+
+    payload = {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+    resp = asyncio.run(api._chat(_FakeRequest(payload)))
+
+    async def abandon_mid_stream():
+        gen = resp.body_iterator
+        await gen.__anext__()  # role frame
+        await gen.__anext__()  # delta frame
+        await gen.aclose()  # client disconnect -> GeneratorExit inside sse()
+
+    asyncio.run(abandon_mid_stream())
+    text = path.read_text(encoding="utf-8")
+    assert "client_disconnected" in text
+    assert "request_start" in text
+    # and no request_end was fabricated for the abandoned stream
+    assert "request_end" not in text
+    eventlog.reset_event_logging()
+
+
+def test_stream_completed_does_not_log_disconnect(tmp_path, monkeypatch):
+    """A stream that reaches its final frame must NOT be misreported as a
+    client disconnect (the happy path still logs request_end only)."""
+    import asyncio
+
+    import gemini_mcp.api as api
+    from test_sessions import _FakeRequest, _StubResult
+
+    path = tmp_path / "ok.log"
+    monkeypatch.setenv("GEMINI_LOG_FILE", str(path))
+    assert configure_event_logging() == path
+
+    class _OkClient:
+        def generate_stream(self, *args, **kwargs):
+            yield {"type": "final", "result": _StubResult(text="done")}
+
+    monkeypatch.setattr(api, "_get_client", lambda: _OkClient())
+    payload = {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+    resp = asyncio.run(api._chat(_FakeRequest(payload)))
+
+    async def drain():
+        async for _ in resp.body_iterator:
+            pass
+
+    asyncio.run(drain())
+    text = path.read_text(encoding="utf-8")
+    assert "request_end" in text
+    assert "client_disconnected" not in text
     eventlog.reset_event_logging()

@@ -293,7 +293,8 @@ TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (0.8, 2.0)
 # operators) can override without rebuilding the client:
 #   GEMINI_STALL_TIMEOUT  seconds without a single byte on the socket (120)
 #   GEMINI_TOTAL_TIMEOUT  total seconds for one StreamGenerate round trip (450)
-# A value <= 0 disables the respective threshold.
+# A value <= 0 disables the respective threshold. Both budgets are per
+# attempt (see stream_watchdog_timeouts): fallback/retry attempts restart them.
 DEFAULT_STALL_TIMEOUT = 120.0
 DEFAULT_TOTAL_TIMEOUT = 450.0
 
@@ -309,11 +310,48 @@ def _env_float(name: str, default: float) -> float:
 
 
 def stream_watchdog_timeouts() -> tuple[float, float]:
-    """(stall_seconds, total_seconds) for the StreamGenerate watchdog."""
+    """(stall_seconds, total_seconds) for the StreamGenerate watchdog.
+
+    NOTE (P2-D): both budgets are PER ATTEMPT, measured inside ``_stream_once``
+    from the moment its own POST starts. When the model fallback chain (or the
+    transient-retry layer) starts another attempt, the clocks restart — the
+    worst-case end-to-end latency is therefore budget x attempts, not budget.
+    """
     return (
         _env_float("GEMINI_STALL_TIMEOUT", DEFAULT_STALL_TIMEOUT),
         _env_float("GEMINI_TOTAL_TIMEOUT", DEFAULT_TOTAL_TIMEOUT),
     )
+
+
+# urllib3 ships with requests (already an import of this module); the guard
+# only future-probes exotic environments.
+try:  # pragma: no cover - trivial import guard
+    from urllib3.exceptions import ReadTimeoutError as _Urllib3ReadTimeoutError
+except Exception:  # noqa: BLE001 - requests cannot function without urllib3
+    _Urllib3ReadTimeoutError = None  # type: ignore[assignment]
+
+
+def _is_body_read_timeout(exc: Exception) -> bool:
+    """Detect a body-phase read timeout wrapped by requests.
+
+    While STREAMING the body, requests (>= 2.3x) re-raises urllib3's
+    ReadTimeoutError as ``requests.ConnectionError`` (models.py:
+    ``except ReadTimeoutError as e: raise ConnectionError(e)``) — only the
+    header-wait phase produces ``requests.ReadTimeout``. The original error
+    lands in ``__context__`` (implicit chaining; ``__cause__`` stays None)
+    and its message ("Read timed out.") inside the wrapper's message. A bare
+    connection RESET must NOT match — only read-timeout shapes do. The
+    message fallback is scoped to ConnectionError instances: a bare
+    ``requests.Timeout("read timed out")`` is a synthetic/legacy shape that
+    keeps its historical (retryable transport) semantics.
+    """
+    for chained in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if (
+            _Urllib3ReadTimeoutError is not None
+            and isinstance(chained, _Urllib3ReadTimeoutError)
+        ):
+            return True
+    return isinstance(exc, requests.ConnectionError) and "read timed out" in str(exc).lower()
 
 
 @dataclass(frozen=True)
@@ -397,6 +435,12 @@ def resolve_model_setting(
 
     Unknown names fall back to ``DEFAULT_MODEL`` (highest tier) so a typo in an
     env var degrades to the intended behaviour instead of the old default.
+
+    Names resolving into ``UNAVAILABLE_MODELS`` (plan-blocked tiers such as
+    carbon / 4-carbon / 高难任务) raise :class:`GeminiWebError` immediately —
+    this is the gate that covers the MCP tools and ``GEMINI_MODEL`` in
+    addition to the REST facade's early 400. A real POST to those tiers would
+    be silently queued forever by the backend.
     """
     key = _normalise_model_name(model if model is not None else DEFAULT_MODEL)
     if key == "legacy":
@@ -405,6 +449,11 @@ def resolve_model_setting(
     if entry is None:
         key = DEFAULT_MODEL
         entry = MODEL_CATALOG[key]
+    if key in UNAVAILABLE_MODELS:
+        raise GeminiWebError(
+            f"{UNAVAILABLE_MODELS[key]}. Try gemini-argon or gemini-pro instead "
+            "(see GET /v1/models)."
+        )
     model_id, default_capacity, model_number = entry
 
     cap = default_capacity
@@ -1279,17 +1328,32 @@ class GeminiWebClient:
                             on_frame(frame)
                         self._consume_frame(frame, result)
         except requests.ReadTimeout as exc:
-            # Zero bytes on the socket for the whole stall window: the model
-            # was accepted but is being silently queued (Ultra-only on a lower
+            # Header-wait phase timed out with the stall budget: the model was
+            # accepted but is being silently queued (Ultra-only on a lower
             # plan) or the backend hung. Not a transport blip — do not retry.
+            # With the watchdog disabled this is an ordinary timeout instead.
+            if stall_timeout > 0:
+                raise GeminiWebError(
+                    f"StreamGenerate stalled: no bytes for {read_timeout:g}s; the "
+                    "model may be unavailable on this plan (e.g. Carbon/Ultra-only)",
+                    stall=True,
+                ) from exc
             raise GeminiWebError(
-                f"StreamGenerate stalled: no bytes for {read_timeout:g}s; the "
-                "model may be unavailable on this plan (e.g. Carbon/Ultra-only)",
-                stall=True,
+                f"StreamGenerate transport error: {exc}", transport=True
             ) from exc
         except requests.RequestException as exc:
-            # Mid-stream disconnect / read timeout: the stream is gone, the
-            # partial result is discarded and _run_with_resilience retries.
+            # Body-phase read timeouts arrive HERE, wrapped by requests as
+            # ConnectionError (see _is_body_read_timeout) — classify them as
+            # stalls too, or a silent upstream would burn two 120s retries and
+            # surface as a misleading 502 while holding the generate lock.
+            if stall_timeout > 0 and _is_body_read_timeout(exc):
+                raise GeminiWebError(
+                    f"StreamGenerate stalled: no bytes for {read_timeout:g}s; the "
+                    "model may be unavailable on this plan (e.g. Carbon/Ultra-only)",
+                    stall=True,
+                ) from exc
+            # Mid-stream disconnect / reset: the stream is gone, the partial
+            # result is discarded and _run_with_resilience retries.
             raise GeminiWebError(
                 f"StreamGenerate transport error: {exc}", transport=True
             ) from exc
@@ -1512,14 +1576,12 @@ class GeminiWebClient:
             ) from exc
         if resp.status_code != 200:
             raise GeminiWebError(
-                f"Upload start failed: HTTP {resp.status_code} — {resp.text[:200]}",
+                f"Upload start failed: HTTP {resp.status_code}",
                 code=resp.status_code,
             )
         upload_url = resp.headers.get("x-goog-upload-url")
         if not upload_url:
-            raise GeminiWebError(
-                f"Upload start returned no x-goog-upload-url: {resp.text[:200]}"
-            )
+            raise GeminiWebError("Upload start returned no x-goog-upload-url header")
 
         # Phase 2: upload, finalize.
         upload_headers = {
@@ -1537,12 +1599,13 @@ class GeminiWebClient:
             ) from exc
         if resp.status_code != 200:
             raise GeminiWebError(
-                f"Upload finalize failed: HTTP {resp.status_code} — {resp.text[:200]}",
+                f"Upload finalize failed: HTTP {resp.status_code}",
                 code=resp.status_code,
             )
         identifier = resp.text.strip()
         if not identifier.startswith("/"):
-            raise GeminiWebError(f"Unexpected upload response: {identifier[:200]}")
+            # Response bodies must never enter error text (event-log red line).
+            raise GeminiWebError("Unexpected upload response (missing /contrib prefix)")
         return [[identifier, file_code, None, mime], name]
 
     def download_media(
@@ -1573,15 +1636,17 @@ class GeminiWebClient:
                                 if chunk:
                                     fh.write(chunk)
                         return str(dest)
+                    # No URL/body fragments in the message (event-log red line):
+                    # status code only.
                     last_error = GeminiWebError(
-                        f"Media download failed: HTTP {resp.status_code} for {url[:120]}",
+                        f"Media download failed: HTTP {resp.status_code}",
                         code=resp.status_code,
                     )
             except Exception as e:  # noqa: BLE001 - transient network errors
                 last_error = e
             if attempt < retries:
                 time.sleep(retry_delay)
-        raise last_error or GeminiWebError(f"Media download failed for {url[:120]}")
+        raise last_error or GeminiWebError("Media download failed")
 
     # ------------------------------------------------------------------
     # batchexecute RPCs

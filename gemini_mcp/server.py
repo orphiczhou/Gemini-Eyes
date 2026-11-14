@@ -45,6 +45,7 @@ from typing import Any, Optional, Union
 
 from mcp.server import MCPServer
 
+from . import __version__
 from .cookie_extractor import cookies_for_gemini
 from .gemini_client import (
     DEFAULT_METADATA,
@@ -419,6 +420,9 @@ def _remember(result) -> None:
 
 mcp = MCPServer(
     "gemini-web",
+    # serverInfo.version for the MCP initialize handshake (was an empty
+    # string before); sourced from the installed distribution metadata.
+    version=__version__,
     instructions=(
         "Bridges to gemini.google.com using the logged-in browser session "
         "(cookie-based auth, no API key). Use gemini_status to check auth, "

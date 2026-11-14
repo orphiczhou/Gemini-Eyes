@@ -475,22 +475,56 @@ def test_conv_evict_cleans_orphan_keys_unconditionally():
     assert server.conv_lookup(["user: u1"], "argon") is not None
 
 
+def test_conv_eviction_forced_on_every_register(monkeypatch):
+    """Deterministic half of P2-G: _CONV_MAX pinned small so every register
+    walks the eviction path — the newest records survive, everything the
+    trimmed records contributed is cleaned up."""
+    monkeypatch.setattr(server, "_CONV_MAX", 4)
+    for i in range(10):
+        _register(cid=f"c_{i}", texts=(f"user: q{i}",))
+    assert len(server._conv_by_cid) == 4
+    assert set(server._conv_by_cid) == {"c_6", "c_7", "c_8", "c_9"}
+    # newest by-id lookups hit; evicted ones miss
+    assert server.conv_lookup([], "argon", conv_id="c_9") is not None
+    assert server.conv_lookup([], "argon", conv_id="c_0") is None
+    # orphan-free: every surviving fingerprint key points at a live record
+    assert server._conv_by_key
+    for key_cid in server._conv_by_key.values():
+        assert key_cid in server._conv_by_cid
+
+
 def test_session_table_thread_smoke(monkeypatch):
-    """Hammer register/lookup from several threads; the lock must keep the
-    table consistent (no lost records, no exceptions)."""
+    """P2-G: hammer register/lookup with _CONV_MAX=4 so EVERY register runs
+    the eviction path concurrently. A lock defect surfaces as an exception,
+    a cross-wired lookup record, or an orphan fingerprint key (a key pointing
+    at a conversation id that no longer has a record) observed under the lock.
+    """
     import threading
 
-    monkeypatch.setattr(server, "_CONV_MAX", 1000)  # keep eviction out of the way
-    errors: list[Exception] = []
+    monkeypatch.setattr(server, "_CONV_MAX", 4)
+    errors: list[str] = []
 
     def worker(n: int) -> None:
         try:
-            for i in range(50):
-                _register(cid=f"c_{n}_{i}", texts=(f"user: q{n}_{i}",))
-                server.conv_lookup([f"user: q{n}_{i}"], "argon")
-                server.conv_lookup([f"user: q{n}_{i}"], "argon", conv_id=f"c_{n}_{i}")
+            for i in range(60):
+                cid = f"c_{n}_{i}"
+                _register(cid=cid, texts=(f"user: q{n}_{i}",))
+                rec = server.conv_lookup([f"user: q{n}_{i}"], "argon", conv_id=cid)
+                if rec is not None and str((rec.metadata or [""])[0] or "") != cid:
+                    errors.append(f"cross-wired record for {cid}")
+                # orphan-free invariant, sampled under the same lock the table
+                # uses (a torn snapshot here means the lock is not held on
+                # some compound path)
+                with server._CONV_LOCK:
+                    orphans = [
+                        k
+                        for k, v in server._conv_by_key.items()
+                        if v not in server._conv_by_cid
+                    ]
+                    if orphans:
+                        errors.append(f"orphan keys under lock: {orphans[:3]}")
         except Exception as exc:  # noqa: BLE001 - record and fail
-            errors.append(exc)
+            errors.append(repr(exc))
 
     threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
     for t in threads:
@@ -498,6 +532,21 @@ def test_session_table_thread_smoke(monkeypatch):
     for t in threads:
         t.join()
     assert not errors
-    assert len(server._conv_by_cid) == 8 * 50  # nothing lost, nothing duplicated
-    # one unique child key per turn + the shared empty-parent key (overwritten)
-    assert len(server._conv_by_key) == 8 * 50 + 1
+    assert len(server._conv_by_cid) <= server._CONV_MAX  # capacity respected
+    # orphan-free at quiesce too
+    for key_cid in server._conv_by_key.values():
+        assert key_cid in server._conv_by_cid
+
+
+# ---------------------------------------------------------------------------
+# γ-1: MCP initialize serverInfo.version is populated
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_serverinfo_version_populated():
+    from gemini_mcp import __version__
+    from gemini_mcp.server import mcp
+
+    assert __version__  # resolved from dist metadata (or synced constant)
+    assert mcp.version == __version__
+    assert mcp.name == "gemini-web"
