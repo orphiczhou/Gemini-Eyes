@@ -46,6 +46,7 @@ from typing import Any, Optional, Union
 from mcp.server import MCPServer
 
 from . import __version__
+from . import state
 from .cookie_extractor import cookies_for_gemini
 from .gemini_client import (
     DEFAULT_METADATA,
@@ -73,6 +74,12 @@ _profile: str = "Default"
 _language: str = "zh-CN"
 _cookie_file: Optional[str] = None
 _metadata_cache: dict[str, list[Any]] = {}  # conversation_id -> metadata
+
+# Hot-reload baseline (epoch seconds): the cookie-file mtime the current
+# _client already reflects. Advanced after every client build AND after our
+# own _persist_cookies write (rotation rewrites the file, which must never
+# look like an external replacement — no read-your-own-write loop).
+_cookies_baseline_at: float = 0.0
 
 # How often to rotate __Secure-1PSIDTS in the background (seconds).
 _ROTATE_INTERVAL = 25 * 60
@@ -309,6 +316,23 @@ def _load_cookies() -> tuple[dict[str, str], list[str]]:
     return cookies_for_gemini(_browser, _profile)
 
 
+def _advance_cookie_baseline() -> None:
+    """Move the hot-reload baseline up to "what the client already reflects".
+
+    Called after a client build (the jar was just read from the file) and
+    after a successful persist (our own write bumped the mtime). The file's
+    CURRENT mtime becomes the baseline, so only a strictly newer external
+    replacement triggers a reload.
+    """
+    global _cookies_baseline_at
+    path = _cookie_file_path()
+    try:
+        mtime = os.path.getmtime(path) if path and os.path.isfile(path) else time.time()
+    except OSError:
+        mtime = time.time()
+    _cookies_baseline_at = max(_cookies_baseline_at, mtime)
+
+
 def _get_client() -> GeminiWebClient:
     global _client
     if _client is not None:
@@ -319,7 +343,59 @@ def _get_client() -> GeminiWebClient:
             "No Google cookies found. " + ("; ".join(errors) if errors else "")
         )
     _client = GeminiWebClient(cookies, language=_language)
+    _advance_cookie_baseline()
     return _client
+
+
+def _maybe_reload_client() -> bool:
+    """Hot-reload the client singleton when the cookie file changed on disk.
+
+    This daemon is the single writer of rotated cookies, but an external dump
+    tool may replace the whole cookie file at any time — the process-level
+    singleton only reads it at construction. Both hot paths (every generate
+    via _generate_serialized, and the _status_payload probe used by recovery
+    orchestrators) call this first: stat the file's mtime and rebuild the
+    singleton under the generate lock when it is strictly newer than
+    _cookies_baseline_at (our own persist advances the baseline, so
+    self-writes never trigger a reload).
+
+    Returns True when the client was rebuilt. A broken new file (bad JSON,
+    missing key cookies) keeps the OLD client and returns False — the process
+    must not die; the next hot path retries once the file is fixed.
+    """
+    global _client
+    if _client is None:
+        return False  # nothing to reload; lazy init in _get_client sets the baseline
+    path = _cookie_file_path()
+    if not path:
+        return False  # browser-extraction session: no file to watch
+    try:
+        if os.path.getmtime(path) <= _cookies_baseline_at:
+            return False
+    except OSError:
+        return False
+    with _GENERATE_LOCK:
+        # Re-check under the lock: a concurrent reload may have won the race
+        # and already advanced the baseline.
+        try:
+            if os.path.getmtime(path) <= _cookies_baseline_at:
+                return False
+        except OSError:
+            return False
+        old = _client
+        _client = None  # _get_client() re-reads via _load_cookies()
+        try:
+            _get_client()
+        except Exception as e:  # noqa: BLE001 - keep the old client alive
+            _client = old
+            log.warning(
+                "Cookie hot-reload failed (new file unusable), keeping previous "
+                "client: %s",
+                e,
+            )
+            return False
+    log.info("Cookie file replaced externally; client hot-reloaded from %s", path)
+    return True
 
 
 def _persist_cookies(client: GeminiWebClient) -> None:
@@ -350,6 +426,10 @@ def _persist_cookies(client: GeminiWebClient) -> None:
                 json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             os.chmod(path, 0o600)
+            # Our own write bumped the mtime — advance the reload baseline so
+            # the next hot-path stat does not mistake it for an external
+            # replacement (read-your-own-write loop).
+            _advance_cookie_baseline()
             log.info("Rotated cookies persisted to %s (%d cookies)", path, len(entries))
         except OSError as e:
             log.warning("Failed to persist rotated cookies: %s", e)
@@ -380,27 +460,48 @@ def _prewarm_account_rpcs() -> None:
             _time.sleep(60 * (attempt + 1))
 
 
+def _rotate_once() -> None:
+    """One rotation cycle (extracted from _auto_rotate_loop for testability).
+
+    ``skip_if_fresh`` + the resolved persist path keep read/write on one
+    file, so concurrent gemini-web clients never turn the shared
+    RotateCookies endpoint into a 429 fight. Rotation and persist run under
+    the generate lock: requests.Session is not thread-safe and the jar merge
+    must not race a streaming response.
+
+    Observability (state.py): rotated=False is a silent auth break — log a
+    WARNING (the package logger feeds the sanitized event log) and bump
+    auth_failures; a success clears the counter. The counters surface on
+    /v1/status (cookie_rotation.last_result) and /healthz (auth_failures).
+    """
+    try:
+        client = _get_client()
+        with _GENERATE_LOCK:
+            rotated = client.rotate_cookies(
+                force=True, skip_if_fresh=True, cookie_file=_cookie_file_path()
+            )
+            if rotated:
+                _persist_cookies(client)
+        if rotated:
+            state.record_rotation(ok=True)
+        else:
+            failures = state.record_rotation(ok=False)
+            log.warning(
+                "Background cookie rotation FAILED (auth_failures=%d): no fresh "
+                "__Secure-1PSIDTS obtained — cookies may be rejected/stale",
+                failures,
+            )
+    except Exception:  # noqa: BLE001 - keep the loop alive
+        log.warning("Background cookie rotation failed", exc_info=True)
+
+
 def _auto_rotate_loop() -> None:
     """Background daemon: renew the short-lived 1PSIDTS cookie periodically.
-
-    ``skip_if_fresh`` + the resolved persist path keep read/write on one file,
-    so concurrent gemini-web clients never turn the shared RotateCookies
-    endpoint into a 429 fight. Rotation and persist run under the generate
-    lock: requests.Session is not thread-safe and the jar merge must not
-    race a streaming response. Sleep carries a small jitter so a fleet of
-    clients does not sync its rotation bursts."""
+    Sleep carries a small jitter so a fleet of clients does not sync its
+    rotation bursts."""
     while True:
         time.sleep(_ROTATE_INTERVAL + random.uniform(-15, 15))
-        try:
-            client = _get_client()
-            with _GENERATE_LOCK:
-                rotated = client.rotate_cookies(
-                    force=True, skip_if_fresh=True, cookie_file=_cookie_file_path()
-                )
-                if rotated:
-                    _persist_cookies(client)
-        except Exception:  # noqa: BLE001 - keep the loop alive
-            log.warning("Background cookie rotation failed", exc_info=True)
+        _rotate_once()
 
 
 def _metadata_for(conversation_id: Optional[str], response_id: Optional[str]) -> Optional[list[Any]]:
@@ -463,9 +564,14 @@ def _status_payload() -> dict[str, Any]:
     """Connection diagnostics shared by the gemini_status tool and GET /v1/status."""
     import platform
 
+    # Status is the recovery orchestrator's probe: run the hot-reload check
+    # FIRST so an externally replaced cookie file is visible to the client
+    # diagnostics below (not just to the raw file read).
+    _maybe_reload_client()
     cookies, errors = _load_cookies()
     key_names = [n for n in REQUIRED_COOKIES if n in cookies]
     missing = [n for n in REQUIRED_COOKIES if n not in cookies]
+    auth_state = state.snapshot()
     status: dict[str, Any] = {
         "ok": False,
         "browser": _browser,
@@ -475,6 +581,11 @@ def _status_payload() -> dict[str, Any]:
         "cookies_present": key_names,
         "cookies_missing": missing,
         "errors": errors,
+        # Rotation-failure observability (state.py): consecutive failed
+        # background rotations; 0 while healthy. Present in EVERY branch —
+        # the recovery orchestrator probes exactly when things are broken.
+        "auth_failures": auth_state["auth_failures"],
+        "cookie_rotation": {"last_result": auth_state["last_result"]},
     }
     if not cookies:
         status["errors"] = errors or ["no cookies available"]
@@ -495,14 +606,16 @@ def _status_payload() -> dict[str, Any]:
         status["language"] = client.language
         status["model"] = client.model_description
         status["session_id_present"] = bool(client.session_id)
-        status["cookie_rotation"] = {
-            "last_rotate_seconds_ago": (
-                round(time.time() - client._last_rotate_at)
-                if client._last_rotate_at else None
-            ),
-            "interval_seconds": _ROTATE_INTERVAL,
-            "persist_to": _cookie_file_path() if _cookies_from_file else None,
-        }
+        status["cookie_rotation"].update(
+            {
+                "last_rotate_seconds_ago": (
+                    round(time.time() - client._last_rotate_at)
+                    if client._last_rotate_at else None
+                ),
+                "interval_seconds": _ROTATE_INTERVAL,
+                "persist_to": _cookie_file_path() if _cookies_from_file else None,
+            }
+        )
     except Exception as e:  # noqa: BLE001 - diagnostics tool must not crash
         status["errors"] = [str(e)]
     return status
@@ -643,8 +756,10 @@ def _generate_serialized(
     """Run one generate call under the process-wide lock and remember the turn.
 
     Usage accounting is left to the callers (the MCP tool and the REST layer
-    each count their own traffic exactly once).
+    each count their own traffic exactly once). Entry hot-reload check: an
+    externally replaced cookie file is picked up here (stat cost only).
     """
+    _maybe_reload_client()
     client = _get_client()
     with _GENERATE_LOCK:
         result = client.generate(

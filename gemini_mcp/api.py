@@ -43,6 +43,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from . import state
 from . import usage
 from .eventlog import event_logger
 from .gemini_client import (
@@ -288,12 +289,18 @@ def _messages_to_prompt(messages: list[dict[str, Any]], continue_conversation: b
 
 
 def _healthz_payload() -> dict[str, Any]:
-    """Light, network-free readiness signal for the plugin control plane."""
+    """Light, network-free readiness signal for the plugin control plane.
+
+    ``auth_failures`` (from state.py — the leaf module shared with server.py,
+    avoiding an api->server->api cycle) counts consecutive failed background
+    cookie rotations: 0 while healthy, >0 means the session is going stale
+    and cookies need external attention."""
     out: dict[str, Any] = {
         "ok": True,
         "pid": os.getpid(),
         "version": _VERSION,
         "uptime_seconds": usage.snapshot()["uptime_seconds"],
+        "auth_failures": state.snapshot()["auth_failures"],
         "ready": False,
         "initError": None,
     }
