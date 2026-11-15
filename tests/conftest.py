@@ -19,3 +19,14 @@ def _isolated_event_log(tmp_path, monkeypatch):
     reset_event_logging()  # force re-configuration with the new env path
     yield
     reset_event_logging()
+
+
+@pytest.fixture(autouse=True)
+def _http_token_source_by_default(monkeypatch):
+    """Keep pre-existing tests on the pure-HTTP token path.
+
+    A test whose fake page lacks SNlM0e would otherwise fall through the
+    auto policy into the browser-assisted path — which could spawn a REAL
+    Edge inside pytest. Tests that exercise the token-source policy set
+    GEMINI_TOKEN_SOURCE explicitly (and stub the browser layer)."""
+    monkeypatch.setenv("GEMINI_TOKEN_SOURCE", "http")

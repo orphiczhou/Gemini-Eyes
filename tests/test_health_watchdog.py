@@ -32,15 +32,17 @@ def _clean_health_state(monkeypatch):
 
 
 class _Harness:
-    """Stub probe/dump/kill/reload; script outcomes and record calls."""
+    """Stub probe/dump/kill/reload/browser-check; script outcomes + record."""
 
     def __init__(self, monkeypatch):
         self.probe_results: list = []  # consumed per probe call; [] -> True
         self.dump_results: list = []   # consumed per dump call; [] -> True
+        self.login_results: list = []  # consumed per login check; [] -> None
         self.probe_calls = 0
         self.dump_calls = 0
         self.kill_calls: list = []
         self.reload_calls: list = []
+        self.login_calls: list = []
         harness = self
 
         def fake_probe(client):
@@ -51,8 +53,14 @@ class _Harness:
             harness.dump_calls += 1
             return harness.dump_results.pop(0) if harness.dump_results else True
 
+        def fake_login():
+            harness.login_calls.append(1)
+            value = harness.login_results.pop(0) if harness.login_results else None
+            return value
+
         monkeypatch.setattr(server, "_probe_credentials", fake_probe)
         monkeypatch.setattr(server, "_run_dump", fake_dump)
+        monkeypatch.setattr(server, "_browser_login_check", fake_login)
         monkeypatch.setattr(
             server, "_run_kill_edge", lambda: harness.kill_calls.append(1) or True
         )
@@ -83,8 +91,8 @@ def test_two_failures_trigger_recovery_then_healthy(h, caplog):
     with caplog.at_level(logging.INFO, logger="gemini_mcp"):
         assert server._health_cycle_once() is True  # fail #2: act
 
-    assert h.dump_calls == 1  # recovery sequence ran (dump -> kill -> verify)
-    assert h.kill_calls == [1]
+    assert h.dump_calls == 1  # recovery sequence ran (dump -> reload -> verify)
+    assert h.kill_calls == []  # Edge is kept alive (token source now)
     assert h.reload_calls == [1]
     assert state.credential_state() == "healthy"  # verification probe passed
     messages = [r.getMessage() for r in caplog.records]

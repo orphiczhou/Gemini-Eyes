@@ -38,17 +38,29 @@ _last_activity_at: Optional[float] = None
 # Credential health classification (health watchdog, server.py)
 #
 # healthy          probes pass; nothing to do.
-# degraded         2+ consecutive probe failures; auto recovery (dump+kill+
-#                  reload+verify) in progress / retrying.
+# degraded          2+ consecutive probe failures; auto recovery (dump +
+#                  reload + verify) in progress / retrying.
+# fetch_blocked    the browser session is HEALTHY (live page holds SNlM0e —
+#                  CDP self-check passed) but cookie-replay HTTP token
+#                  fetch is blocked (session-device binding, DBSC-class).
+#                  NOT a login problem: browser-assisted tokens are the
+#                  path back (GEMINI_TOKEN_SOURCE=auto/cdp).
 # dead_wait        the dump tool itself failed (exit 1 / timeout); retry is
 #                  backed off 30min -> 1h -> 4h (cap). Probing continues.
-# dead_needs_login dump succeeds but the session stays dead: the dedicated
-#                  Edge profile is a dead shell only a HUMAN login fixes.
-#                  Auto-dumping stops (pointless); probes slow to 30min and
-#                  reconnect fully automatically once one passes.
+# dead_needs_login dump succeeds, the session stays dead AND the browser
+#                  page is logged out too (CDP self-check failed): a dead
+#                  shell only a HUMAN login fixes. Auto-dumping stops
+#                  (pointless); probes slow to 30min and reconnect fully
+#                  automatically once one passes.
 # ---------------------------------------------------------------------------
 
-CREDENTIAL_STATES = ("healthy", "degraded", "dead_wait", "dead_needs_login")
+CREDENTIAL_STATES = (
+    "healthy",
+    "degraded",
+    "fetch_blocked",
+    "dead_wait",
+    "dead_needs_login",
+)
 _HEALTH_INTERVAL_DEFAULT_MINUTES = 15.0
 _DEAD_PROBE_INTERVAL_MINUTES = 30.0
 # dead_wait backoff per consecutive dump failure (minutes), capped at the

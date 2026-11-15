@@ -61,6 +61,7 @@ from typing import Any, Optional, Union
 from mcp.server import MCPServer
 
 from . import __version__
+from . import browser_token
 from . import state
 from .cookie_extractor import cookies_for_gemini
 from .gemini_client import (
@@ -705,13 +706,79 @@ def _verify_probe_after_reload() -> Optional[bool]:
         _GENERATE_LOCK.release()
 
 
+def _browser_login_check() -> Optional[str]:
+    """CDP login-state self-check: does the LIVE browser page hold SNlM0e?
+
+    Token present == truly signed in. Returns the token (memory only) or
+    None. Thin wrapper so tests stub one seam; never raises.
+    """
+    try:
+        return browser_token.get_browser_token()
+    except Exception:  # noqa: BLE001 - a broken check must not kill recovery
+        return None
+
+
+def _classify_dead_profile() -> None:
+    """CDP login-state self-check BEFORE any 'needs login' verdict.
+
+    User rule (never misreport): a dump can succeed with full cookie names
+    while the session is dead in TWO different ways. Only a live-browser
+    check separates them:
+    * browser page signed-in (SNlM0e present) -> the session is FINE and
+      only cookie-replay token fetching is blocked (DBSC-class) ->
+      fetch_blocked, NOT dead_needs_login. Retry via the browser-assisted
+      token path (GEMINI_TOKEN_SOURCE=auto does this inside init).
+    * browser page logged out too -> genuinely dead_needs_login.
+    """
+    login_token = _browser_login_check()
+    if login_token is None:
+        state.set_credential_state(
+            "dead_needs_login",
+            detail=(
+                "dump ok but session dead x2 AND browser page logged out - "
+                "manual login required; auto-dump stopped, probing every "
+                "30min until it recovers"
+            ),
+        )
+        return
+    state.set_credential_state(
+        "fetch_blocked",
+        detail=(
+            "browser session healthy but HTTP token fetch blocked "
+            "(session-device binding) - switching to browser-assisted token"
+        ),
+    )
+    # The auto token policy makes init() itself fall back to CDP, so a plain
+    # verify probe now exercises the browser-assisted path end to end.
+    verified = _verify_probe_after_reload()
+    if verified:
+        state.record_probe(True)
+        state.set_credential_state(
+            "healthy", detail="browser-assisted token verified"
+        )
+    elif verified is None:
+        log.info(
+            "health recovery: browser-assisted verification deferred "
+            "(requests in flight); retry next cycle"
+        )
+    else:
+        log.info(
+            "health recovery: browser-assisted token did not heal the probe "
+            "(generate channel evidence recorded); staying fetch_blocked"
+        )
+
+
 def _attempt_recovery() -> None:
-    """One recovery sequence: dump -> kill edge -> reload + verify.
+    """One recovery sequence: dump -> reload + verify (+ classification).
 
     Classification on failure is the whole point: dump failing means the
     TOOL is stuck (dead_wait, back off); dump succeeding while the session
-    stays dead means the profile itself is a dead shell (dead_needs_login
-    after two cycles — only a human login fixes that).
+    stays dead needs the CDP login-state self-check before any verdict
+    (fetch_blocked vs dead_needs_login — see _classify_dead_profile).
+
+    The spawned Edge is deliberately KEPT ALIVE (no kill-mcp-edge here):
+    under session-device binding it is the token source, and later token
+    refreshes reuse the same browser. The kill tool remains for manual use.
     """
     dump_ok = _run_dump()
     if not dump_ok:
@@ -721,7 +788,6 @@ def _attempt_recovery() -> None:
         )
         return
     state.register_dump_succeeded()
-    _run_kill_edge()
     verified = _verify_probe_after_reload()
     if verified is None:
         log.info("health recovery: verification deferred (requests in flight)")
@@ -735,14 +801,7 @@ def _attempt_recovery() -> None:
         return
     streak = state.register_dump_ok_but_still_dead()
     if streak >= 2:
-        state.set_credential_state(
-            "dead_needs_login",
-            detail=(
-                "dump ok but session still dead x2 - the dedicated Edge "
-                "profile needs a manual login; auto-dump stopped, probing "
-                "every 30min until it recovers"
-            ),
-        )
+        _classify_dead_profile()  # CDP self-check decides fetch_blocked vs dead
     else:
         log.info(
             "health recovery: dump ok but probe still failing (%d/2)", streak
@@ -790,9 +849,12 @@ def _handle_probe_fail() -> None:
         return  # dead shell: no auto-dump; 30-min probes wait for a login
     if state.recovery_deferred():
         return  # dead_wait backoff window — next attempt comes later
-    state.set_credential_state(
-        "degraded", detail=f"probe failed x{state.probe_fail_streak()}"
-    )
+    if state.credential_state() not in ("degraded", "fetch_blocked"):
+        # fetch_blocked keeps its classification (no downgrade to degraded):
+        # re-running recovery re-dumps AND re-verifies via the browser path.
+        state.set_credential_state(
+            "degraded", detail=f"probe failed x{state.probe_fail_streak()}"
+        )
     with _HEALTH_RECOVERY_LOCK:
         _attempt_recovery()
 

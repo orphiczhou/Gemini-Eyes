@@ -31,6 +31,8 @@ from typing import Any, Callable, Iterator, Optional, Union
 
 import requests
 
+from . import browser_token
+
 logger = logging.getLogger(__name__)
 
 # Single-writer lock for the shared requests.Session: generate() calls (any
@@ -765,6 +767,9 @@ class GeminiWebClient:
         self.session_id: Optional[str] = None
         self._token_fetched_at: float = 0.0
         self._last_rotate_at: float = 0.0
+        # Where the current access_token came from: "http" (page parse) or
+        # "cdp" (browser-assisted, see browser_token.py). Diagnostics only.
+        self.token_source: Optional[str] = None
         self._reqid = random.randint(10000, 99999)
 
     # ------------------------------------------------------------------
@@ -810,12 +815,47 @@ class GeminiWebClient:
         sid = re.search(r'"FdrFJe":\s*"(.*?)"', text)
         ui_lang = re.search(r'"TuX5cc":\s*"(.*?)"', text)
         push_id = re.search(r'"qKIAYe":\s*"(.*?)"', text)
-        if not token:
-            raise GeminiWebError(
-                "Could not parse SNlM0e token from the Gemini page. "
-                "Cookies are probably expired; log in to gemini.google.com in the browser."
-            )
-        self.access_token = token.group(1)
+
+        policy = browser_token.token_source_policy()
+        # auto: http parse first; fall back to the browser ONLY on the DBSC
+        # "shell without token" shape (page 200 but SNlM0e stripped). http:
+        # the old path exactly, never the browser. cdp: the browser only.
+        use_browser = policy == "cdp" or (token is None and policy == "auto")
+        if not use_browser:
+            if token is None:
+                raise GeminiWebError(
+                    "Could not parse SNlM0e token from the Gemini page. "
+                    "Cookies are probably expired; log in to gemini.google.com "
+                    "in the browser."
+                )
+            self.access_token = token.group(1)
+            self.token_source = "http"
+        else:
+            # The live browser page still receives the token even when the
+            # replayed-cookie page does not; extract it read-only over CDP.
+            # The aux values below still come from this (successful) GET.
+            browser_value = browser_token.get_browser_token()
+            if browser_value:
+                self.access_token = browser_value
+                self.token_source = "cdp"
+                logger.info(
+                    "SNlM0e via browser (CDP); http page parse %s",
+                    "skipped (GEMINI_TOKEN_SOURCE=cdp)"
+                    if token is not None
+                    else "empty (session-device binding)",
+                )
+            else:
+                hint = (
+                    "Browser token source (CDP) unavailable — check the "
+                    "dedicated Edge profile."
+                    if policy == "cdp"
+                    else "Browser-assisted token fetch (CDP) also failed."
+                )
+                raise GeminiWebError(
+                    "Could not parse SNlM0e token from the Gemini page. "
+                    "Cookies are probably expired; log in to gemini.google.com "
+                    f"in the browser. {hint}"
+                )
         self.build_label = bl.group(1) if bl else None
         # Aux page values (stored for diagnostics; the web app sends the UI
         # language as hl and the push subscription id on upload flows).
