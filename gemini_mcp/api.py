@@ -294,13 +294,18 @@ def _healthz_payload() -> dict[str, Any]:
     ``auth_failures`` (from state.py — the leaf module shared with server.py,
     avoiding an api->server->api cycle) counts consecutive failed background
     cookie rotations: 0 while healthy, >0 means the session is going stale
-    and cookies need external attention."""
+    and cookies need external attention. ``idle_timeout_minutes`` /
+    ``last_activity_seconds_ago`` expose the idle auto-exit clock; /healthz
+    itself deliberately does NOT refresh activity — a control-plane probe
+    must not keep the daemon alive forever."""
     out: dict[str, Any] = {
         "ok": True,
         "pid": os.getpid(),
         "version": _VERSION,
         "uptime_seconds": usage.snapshot()["uptime_seconds"],
         "auth_failures": state.snapshot()["auth_failures"],
+        "idle_timeout_minutes": state.idle_timeout_minutes(),
+        "last_activity_seconds_ago": round(state.last_activity_seconds_ago(), 1),
         "ready": False,
         "initError": None,
     }
@@ -366,6 +371,7 @@ async def _healthz(request: Request) -> JSONResponse:
 
 
 def _models_payload() -> dict[str, Any]:
+    state.touch_activity()  # REST request = real activity (idle clock refresh)
     data = []
     for name, (model_id, capacity, number) in MODEL_CATALOG.items():
         entry = {
@@ -467,6 +473,7 @@ async def _usage(request: Request) -> JSONResponse:
 
 
 async def _chat(request: Request) -> JSONResponse:
+    state.touch_activity()  # request start: long generations/streams never trip the idle exit
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 - malformed body

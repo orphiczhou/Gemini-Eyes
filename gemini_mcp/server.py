@@ -25,6 +25,11 @@ Tools exposed:
 ``--transport http`` additionally serves an OpenAI-compatible REST facade on
 the same port (see api.py): POST /v1/chat/completions, GET /v1/models,
 /v1/status, /v1/usage, plus an unauthenticated GET /healthz probe.
+
+Idle auto-exit: with no real requests (chat/tool/status — NOT cookie
+rotation or /healthz probes) for ``GEMINI_IDLE_TIMEOUT`` minutes (default
+30, ``0`` disables), a watchdog thread logs a WARNING and exits the process,
+so a closed/unused plugin stops the daemon.
 """
 
 from __future__ import annotations
@@ -83,6 +88,9 @@ _cookies_baseline_at: float = 0.0
 
 # How often to rotate __Secure-1PSIDTS in the background (seconds).
 _ROTATE_INTERVAL = 25 * 60
+
+# How often the idle watchdog wakes to check GEMINI_IDLE_TIMEOUT (seconds).
+_IDLE_CHECK_INTERVAL = 60
 
 # ---------------------------------------------------------------------------
 # Conversation session table (fingerprint chain for stateless clients)
@@ -522,6 +530,43 @@ def _auto_rotate_loop() -> None:
         _rotate_once()
 
 
+def _idle_check_once() -> bool:
+    """One idle-watchdog cycle; returns True when the idle exit was ordered.
+
+    Exit is ``os._exit(0)`` — deliberately non-blocking: no lock acquisition,
+    no thread joins, no graceful shutdown that could hang on a stuck
+    GENERATE_LOCK or a half-open stream. The cookie-rotation thread (and any
+    other daemon thread) dies with the process; per spec that needs no
+    graceful goodbye. The WARNING below is flushed by the rotating handler
+    on emit, so it lands in the event log before the process vanishes.
+    """
+    timeout_minutes = state.idle_timeout_minutes()
+    if timeout_minutes <= 0:
+        return False  # GEMINI_IDLE_TIMEOUT=0 (or negative): never self-exit
+    idle_seconds = state.last_activity_seconds_ago()
+    if idle_seconds < timeout_minutes * 60:
+        return False
+    log.warning(
+        "Idle auto-exit: no real requests for %.1f minutes (GEMINI_IDLE_TIMEOUT=%g). "
+        "Exiting so a closed/unused plugin stops the daemon; the cookie-rotation "
+        "thread dies with the process. Restart the daemon on next use.",
+        idle_seconds / 60.0,
+        timeout_minutes,
+    )
+    os._exit(0)
+    return True  # unreachable in production; seen by tests that stub os._exit
+
+
+def _idle_watchdog_loop() -> None:
+    """Background daemon: exit the process after GEMINI_IDLE_TIMEOUT minutes
+    without real requests (chat generate / tool calls / status probes — see
+    state.touch_activity). /healthz and cookie rotation do NOT count."""
+    while True:
+        time.sleep(_IDLE_CHECK_INTERVAL)
+        if _idle_check_once():
+            return  # tests stub os._exit; production never reaches this
+
+
 def _metadata_for(conversation_id: Optional[str], response_id: Optional[str]) -> Optional[list[Any]]:
     if not conversation_id:
         return None
@@ -584,7 +629,9 @@ def _status_payload() -> dict[str, Any]:
 
     # Status is the recovery orchestrator's probe: run the hot-reload check
     # FIRST so an externally replaced cookie file is visible to the client
-    # diagnostics below (not just to the raw file read).
+    # diagnostics below (not just to the raw file read). A status probe is
+    # real activity (per spec) — it refreshes the idle clock.
+    state.touch_activity()
     _maybe_reload_client()
     cookies, errors = _load_cookies()
     key_names = [n for n in REQUIRED_COOKIES if n in cookies]
@@ -654,6 +701,7 @@ def gemini_models() -> dict[str, Any]:
     body field of the OpenAI-compatible ``/v1/chat/completions`` endpoint).
     """
     tiers = []
+    state.touch_activity()  # tool call = real activity (idle clock refresh)
     for name, (model_id, capacity, number) in MODEL_CATALOG.items():
         tiers.append(
             {
@@ -690,6 +738,7 @@ def _usage_payload() -> dict[str, Any]:
     """
     from .usage import snapshot
 
+    state.touch_activity()  # usage query = real activity (idle clock refresh)
     data: dict[str, Any] = snapshot()
     try:
         client = _get_client()
@@ -777,6 +826,7 @@ def _generate_serialized(
     each count their own traffic exactly once). Entry hot-reload check: an
     externally replaced cookie file is picked up here (stat cost only).
     """
+    state.touch_activity()  # request start: long generations never trip the idle exit
     _maybe_reload_client()
     client = _get_client()
     with _GENERATE_LOCK:
@@ -1073,6 +1123,7 @@ def gemini_download_media(
     """
     if not url or not save_path:
         raise ValueError("url and save_path must not be empty")
+    state.touch_activity()  # tool call = real activity (idle clock refresh)
     with _GENERATE_LOCK:  # shared session: single-writer with generate
         path = _get_client().download_media(url, save_path)
     return {"path": path}
@@ -1115,6 +1166,7 @@ def gemini_list_conversations(limit: int = 13) -> list[dict[str, Any]]:
     """
     if not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
+    state.touch_activity()  # tool call = real activity (idle clock refresh)
     with _GENERATE_LOCK:  # shared session: single-writer with generate
         return _get_client().list_conversations(limit=limit)
 
@@ -1132,6 +1184,7 @@ def gemini_read_conversation(conversation_id: str, limit: int = 10) -> dict[str,
     """
     if not conversation_id:
         raise ValueError("conversation_id must not be empty")
+    state.touch_activity()  # tool call = real activity (idle clock refresh)
     with _GENERATE_LOCK:
         return _get_client().read_conversation(conversation_id, limit=limit)
 
@@ -1145,6 +1198,7 @@ def gemini_delete_conversation(conversation_id: str) -> dict[str, str]:
     """
     if not conversation_id:
         raise ValueError("conversation_id must not be empty")
+    state.touch_activity()  # tool call = real activity (idle clock refresh)
     with _GENERATE_LOCK:
         _get_client().delete_conversation(conversation_id)
     _metadata_cache.pop(conversation_id, None)
@@ -1211,6 +1265,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     import threading
 
     threading.Thread(target=_auto_rotate_loop, daemon=True, name="gemini-cookie-rotator").start()
+    # Idle watchdog: exit the process after GEMINI_IDLE_TIMEOUT minutes
+    # without real requests (chat/tool/status) — "plugin closed → daemon
+    # stopped" without an explicit shutdown event. Rotation does not count
+    # as activity, and the rotation thread dies with the process (no join).
+    threading.Thread(target=_idle_watchdog_loop, daemon=True, name="gemini-idle-watchdog").start()
     # Warm the model-discovery cache in the background so /v1/models (and any
     # consumer of the roster) is served instantly from cache and never hangs
     # on the network or the generate lock.
