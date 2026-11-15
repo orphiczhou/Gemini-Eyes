@@ -30,6 +30,15 @@ Idle auto-exit: with no real requests (chat/tool/status — NOT cookie
 rotation or /healthz probes) for ``GEMINI_IDLE_TIMEOUT`` minutes (default
 30, ``0`` disables), a watchdog thread logs a WARNING and exits the process,
 so a closed/unused plugin stops the daemon.
+
+Health watchdog: every ``GEMINI_HEALTH_CHECK_INTERVAL_MIN`` minutes
+(default 15, ``0`` disables) the credentials are probed (the SNlM0e page
+fetch). Two consecutive failures trigger an autonomous recovery
+(tools/mcp-browser-profile.ps1 -Dump, kill leftover profile Edge, hot-reload,
+verify) and classify the failure: dead_wait (dump failed; backoff
+30min/1h/4h) vs dead_needs_login (dump ok but the session stays dead twice —
+the dedicated Edge profile needs a manual login; probing slows to 30min and
+reconnects automatically once it passes).
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -567,6 +577,272 @@ def _idle_watchdog_loop() -> None:
             return  # tests stub os._exit; production never reaches this
 
 
+# ---------------------------------------------------------------------------
+# Health watchdog: periodic credential self-healing with dead-profile
+# classification. Two failure shapes look identical from the outside (dump
+# exit 0 + full cookie names, yet SNlM0e fetch keeps failing): a risk-control
+# window (just wait) and a dead dedicated-profile session (only a human login
+# fixes it). The machine below distinguishes them by what happens AFTER a
+# successful dump: still dead twice => dead_needs_login, stop auto-dumping.
+# ---------------------------------------------------------------------------
+
+# Serializes recovery sequences (dump -> kill edge -> reload -> verify); the
+# probe itself only READS. Deliberately NOT the generate lock: recovery must
+# never wait behind (or block) in-flight requests — the cycle skips instead.
+_HEALTH_RECOVERY_LOCK = threading.Lock()
+
+# Repo-root tools/ (dump + kill scripts live beside the package).
+_TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
+
+_DUMP_TIMEOUT_SECONDS = 60
+_KILL_TIMEOUT_SECONDS = 30
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a subprocess and its children (powershell spawns node/edge)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            import signal
+
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass  # already gone — the goal is achieved either way
+
+
+def _run_powershell(script: Path, args: list[str], timeout: float) -> bool:
+    """Run a tools/*.ps1 script; True on exit 0. On timeout the whole process
+    tree is killed. stdout/stderr are captured but never logged (a dump could
+    echo cookie material — exit status is all we report)."""
+    if not script.is_file():
+        log.warning("health recovery: script missing: %s", script)
+        return False
+    cmd = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        *args,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except OSError as e:
+        log.warning("health recovery: cannot spawn powershell for %s: %s", script.name, e)
+        return False
+    try:
+        proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc.pid)
+        proc.communicate()  # reap the corpse
+        log.warning(
+            "health recovery: %s timed out after %.0fs (process tree killed)",
+            script.name,
+            timeout,
+        )
+        return False
+    if proc.returncode != 0:
+        log.warning(
+            "health recovery: %s exited with code %s", script.name, proc.returncode
+        )
+        return False
+    return True
+
+
+def _run_dump() -> bool:
+    """Dump fresh cookies from the dedicated Edge profile into cookies.json
+    (tools/mcp-browser-profile.ps1 -Dump; the file it writes is exactly what
+    _maybe_reload_client watches)."""
+    return _run_powershell(
+        _TOOLS_DIR / "mcp-browser-profile.ps1", ["-Dump"], _DUMP_TIMEOUT_SECONDS
+    )
+
+
+def _run_kill_edge() -> bool:
+    """Kill leftover msedge processes running on the dedicated MCP profile, so
+    the profile is not driven by a stray browser after the dump."""
+    return _run_powershell(
+        _TOOLS_DIR / "kill-mcp-edge.ps1", [], _KILL_TIMEOUT_SECONDS
+    )
+
+
+def _probe_credentials(client: GeminiWebClient) -> bool:
+    """Light liveness probe: the client's SNlM0e bootstrap (one page GET).
+
+    Reuses client.init(force=True) — the exact signal real requests depend
+    on. init() may internally attempt one cookie rotation, but it never
+    persists: the probe stays read-only w.r.t. the credential file, and it
+    NEVER touches activity (self-checks must not keep the daemon alive).
+    """
+    try:
+        client.init(force=True)
+        return True
+    except Exception:  # noqa: BLE001 - any failure counts as a failed probe
+        return False
+
+
+def _verify_probe_after_reload() -> Optional[bool]:
+    """Hot-reload the freshly dumped cookies.json and probe again.
+
+    Returns None when verification could not run (a request grabbed the
+    generate lock mid-recovery): the caller keeps the current state and the
+    next cycle re-verifies — no penalty, no false dead classification.
+    """
+    _maybe_reload_client()  # takes the generate lock internally (brief)
+    if not _GENERATE_LOCK.acquire(blocking=False):
+        return None
+    try:
+        return _probe_credentials(_get_client())
+    finally:
+        _GENERATE_LOCK.release()
+
+
+def _attempt_recovery() -> None:
+    """One recovery sequence: dump -> kill edge -> reload + verify.
+
+    Classification on failure is the whole point: dump failing means the
+    TOOL is stuck (dead_wait, back off); dump succeeding while the session
+    stays dead means the profile itself is a dead shell (dead_needs_login
+    after two cycles — only a human login fixes that).
+    """
+    dump_ok = _run_dump()
+    if not dump_ok:
+        backoff = state.register_dump_failed()
+        state.set_credential_state(
+            "dead_wait", detail=f"dump failed; next attempt in {backoff:.0f}min"
+        )
+        return
+    state.register_dump_succeeded()
+    _run_kill_edge()
+    verified = _verify_probe_after_reload()
+    if verified is None:
+        log.info("health recovery: verification deferred (requests in flight)")
+        state.set_credential_state(
+            "degraded", detail="dump ok; verification pending requests"
+        )
+        return
+    if verified:
+        state.record_probe(True)  # truthful streak bookkeeping
+        state.set_credential_state("healthy", detail="dump + verify ok")
+        return
+    streak = state.register_dump_ok_but_still_dead()
+    if streak >= 2:
+        state.set_credential_state(
+            "dead_needs_login",
+            detail=(
+                "dump ok but session still dead x2 - the dedicated Edge "
+                "profile needs a manual login; auto-dump stopped, probing "
+                "every 30min until it recovers"
+            ),
+        )
+    else:
+        log.info(
+            "health recovery: dump ok but probe still failing (%d/2)", streak
+        )
+        state.set_credential_state("degraded", detail="dump ok; probe still failing")
+
+
+def _handle_probe_ok() -> None:
+    if state.credential_state() == "healthy":
+        return
+    # A probe passed while broken: fresh cookies arrived (external dump, or
+    # the user logged into the profile). Re-dump the freshest state, verify,
+    # and reconnect fully automatically — no human step beyond the login.
+    with _HEALTH_RECOVERY_LOCK:
+        if _run_dump():
+            verified = _verify_probe_after_reload()
+            if verified is True:
+                state.set_credential_state("healthy", detail="re-dump + verify ok")
+                return
+            if verified is None:
+                log.info(
+                    "health recovery: verification deferred (requests in flight); "
+                    "state unchanged until the next cycle"
+                )
+                return
+            # verified is False: the re-dump clobbered working cookies with
+            # dead-shell ones — reclassify and let the machine take it from here
+            state.record_probe(False)
+            state.set_credential_state(
+                "degraded", detail="probe ok earlier; re-dump verification failed"
+            )
+            return
+        else:
+            # the session works right now (probe passed): classify healthy
+            # even though the refresh dump failed — note it in the detail
+            state.set_credential_state(
+                "healthy", detail="probe ok; refresh dump failed (kept working cookies)"
+            )
+
+
+def _handle_probe_fail() -> None:
+    if state.probe_fail_streak() < 2:
+        return  # single blip (proxy jitter) — wait for a second failure
+    if state.credential_state() == "dead_needs_login":
+        return  # dead shell: no auto-dump; 30-min probes wait for a login
+    if state.recovery_deferred():
+        return  # dead_wait backoff window — next attempt comes later
+    state.set_credential_state(
+        "degraded", detail=f"probe failed x{state.probe_fail_streak()}"
+    )
+    with _HEALTH_RECOVERY_LOCK:
+        _attempt_recovery()
+
+
+def _health_cycle_once() -> bool:
+    """One health-watchdog cycle (probe + classification + recovery).
+
+    Returns False when the round was SKIPPED because the generate lock was
+    held (requests in flight): neither the probe nor any recovery action
+    may start behind a live request. The probe itself never touches
+    activity — health self-checks must not reset the idle clock.
+    """
+    if not _GENERATE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        try:
+            ok = _probe_credentials(_get_client())
+        except Exception:  # noqa: BLE001 - no cookies at all = failed probe
+            ok = False
+    finally:
+        _GENERATE_LOCK.release()
+    state.record_probe(ok)  # updates last_health_check; NOT touch_activity
+    if ok:
+        _handle_probe_ok()
+    else:
+        _handle_probe_fail()
+    return True
+
+
+def _health_probe_interval_minutes() -> float:
+    """Current probe cadence: 30min in dead_needs_login, else the env value."""
+    if state.credential_state() == "dead_needs_login":
+        return state.dead_probe_interval_minutes()
+    return state.health_check_interval_minutes()
+
+
+def _health_watchdog_loop() -> None:
+    """Background daemon: probe credentials every
+    GEMINI_HEALTH_CHECK_INTERVAL_MIN minutes and self-heal (see
+    _health_cycle_once). The thread is only started when the interval > 0;
+    a runtime env drop to <= 0 stops it."""
+    while True:
+        interval = _health_probe_interval_minutes()
+        if interval <= 0:
+            log.info("health watchdog disabled (interval <= 0); thread exiting")
+            return
+        time.sleep(interval * 60)
+        _health_cycle_once()
+
+
 def _metadata_for(conversation_id: Optional[str], response_id: Optional[str]) -> Optional[list[Any]]:
     if not conversation_id:
         return None
@@ -651,6 +927,9 @@ def _status_payload() -> dict[str, Any]:
         # the recovery orchestrator probes exactly when things are broken.
         "auth_failures": auth_state["auth_failures"],
         "cookie_rotation": {"last_result": auth_state["last_result"]},
+        # Credential-health classification (health watchdog): healthy /
+        # degraded / dead_wait / dead_needs_login + probe cadence.
+        **state.credential_snapshot(),
     }
     if not cookies:
         status["errors"] = errors or ["no cookies available"]
@@ -1270,6 +1549,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     # stopped" without an explicit shutdown event. Rotation does not count
     # as activity, and the rotation thread dies with the process (no join).
     threading.Thread(target=_idle_watchdog_loop, daemon=True, name="gemini-idle-watchdog").start()
+    # Health watchdog (GEMINI_HEALTH_CHECK_INTERVAL_MIN, default 15min,
+    # 0 disables): periodic credential probe + autonomous recovery with
+    # dead-profile classification. Skips rounds while requests are in flight.
+    if state.health_check_interval_minutes() > 0:
+        threading.Thread(
+            target=_health_watchdog_loop, daemon=True, name="gemini-health-watchdog"
+        ).start()
     # Warm the model-discovery cache in the background so /v1/models (and any
     # consumer of the roster) is served instantly from cache and never hangs
     # on the network or the generate lock.

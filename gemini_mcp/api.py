@@ -297,7 +297,9 @@ def _healthz_payload() -> dict[str, Any]:
     and cookies need external attention. ``idle_timeout_minutes`` /
     ``last_activity_seconds_ago`` expose the idle auto-exit clock; /healthz
     itself deliberately does NOT refresh activity — a control-plane probe
-    must not keep the daemon alive forever."""
+    must not keep the daemon alive forever. The credential_* fields mirror
+    the health watchdog's classification (healthy / degraded / dead_wait /
+    dead_needs_login) — read-only here, probing never refreshes activity."""
     out: dict[str, Any] = {
         "ok": True,
         "pid": os.getpid(),
@@ -309,6 +311,7 @@ def _healthz_payload() -> dict[str, Any]:
         "ready": False,
         "initError": None,
     }
+    out.update(state.credential_snapshot())
     try:
         _get_client()  # constructs the client from the cookie file (no network)
         out["ready"] = True
